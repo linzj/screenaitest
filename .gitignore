@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Output files
+*_ocr.txt
+
+# Debug files
+debug_*.png
+crop_*.png
+input_*.png
+
+# IDE
+.vscode/
+.idea/
