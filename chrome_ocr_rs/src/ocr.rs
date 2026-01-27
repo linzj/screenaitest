@@ -348,8 +348,8 @@ impl ChromeOCR {
 
                         let x_dist = (other.1 - g.1).abs();
                         let y_dist = (other.2 - g.2).abs();
-                        let x_thresh = other.3 + g.3;
-                        let y_thresh = (other.4 + g.4) * 0.25;
+                        let x_thresh = other.3 + g.3; // Same as Python
+                        let y_thresh = (other.4 + g.4) * 0.3; // Same as Python
 
                         if x_dist < x_thresh && y_dist < y_thresh {
                             group.push(j);
