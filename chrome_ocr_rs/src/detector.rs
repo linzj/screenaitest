@@ -103,7 +103,7 @@ impl TextDetector {
 
         // Create interpreter for this detection with multi-threading and XNNPACK
         let mut options = Options::default();
-        options.thread_count = 4; // Use 4 threads
+        options.thread_count = 8; // Use 8 threads
         options.is_xnnpack_enabled = true; // Enable XNNPACK acceleration
         let interpreter = Interpreter::new(&self.model, Some(options))?;
         interpreter.allocate_tensors()?;
