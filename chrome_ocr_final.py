@@ -610,7 +610,7 @@ class ChromeOCR:
             line_num = 0
             for i, box in enumerate(sorted_lines):
                 b = box['bbox']
-                # 4096坐标转回原图坐标
+                # Convert 4096 coordinates back to original image coordinates
                 x1 = int((b[0] - offset_x) / scale)
                 y1 = int((b[1] - offset_y) / scale)
                 x2 = int((b[2] - offset_x) / scale)
@@ -622,21 +622,27 @@ class ChromeOCR:
                 if x2 - x1 < 10 or y2 - y1 < 5:
                     continue
 
-                # 从原图裁剪
+                # Crop region from original image
                 region = orig_gray.crop((x1, y1, x2, y2))
-                t0 = time.perf_counter()
-                text, conf = self.recognizer.recognize(region, return_conf=True)
-                t1 = time.perf_counter()
-                rec_times.append(t1 - t0)
 
-                if text.strip() and conf >= min_conf:
-                    line_num += 1
-                    # Save line image if save_lines is enabled
-                    if self.save_lines and lines_dir:
-                        line_path = Path(lines_dir) / f'line_{line_num:03d}.png'
-                        region.save(str(line_path))
-                    print(f"  L{line_num} (y={y1:4d}) conf={conf:.2f}: {text}")
-                    results.append(text)
+                # Split multi-line regions if detected
+                sub_regions = self._split_multiline_region(region)
+
+                for sub_idx, (sub_region, sub_y_offset) in enumerate(sub_regions):
+                    t0 = time.perf_counter()
+                    text, conf = self.recognizer.recognize(sub_region, return_conf=True)
+                    t1 = time.perf_counter()
+                    rec_times.append(t1 - t0)
+
+                    if text.strip() and conf >= min_conf:
+                        line_num += 1
+                        actual_y = y1 + sub_y_offset
+                        # Save line image if save_lines is enabled
+                        if self.save_lines and lines_dir:
+                            line_path = Path(lines_dir) / f'line_{line_num:03d}.png'
+                            sub_region.save(str(line_path))
+                        print(f"  L{line_num} (y={actual_y:4d}) conf={conf:.2f}: {text}")
+                        results.append(text)
 
             ocr_end = time.perf_counter()
 
@@ -714,6 +720,57 @@ class ChromeOCR:
         y2 = max(b['bbox'][3] for b in row_boxes)
         conf = max(b['conf'] for b in row_boxes)
         return {'bbox': [x1, y1, x2, y2], 'conf': conf}
+
+    def _split_multiline_region(self, region):
+        """Split a region containing multiple text lines using horizontal projection.
+
+        Returns list of (sub_region, y_offset) tuples.
+        """
+        arr = np.array(region)
+        h, w = arr.shape
+
+        # Single line threshold: if height < 1.5x expected line height, don't split
+        # Typical Chinese character is roughly square, so line height ~ width/char_count
+        # For safety, use height < 60 as single line threshold
+        if h < 60:
+            return [(region, 0)]
+
+        # Binary threshold and horizontal projection
+        binary = (arr < 200).astype(np.uint8)
+        h_proj = np.sum(binary, axis=1)
+
+        # Find text line regions
+        threshold = max(np.max(h_proj) * 0.1, 1)
+        in_line = False
+        lines = []
+        line_start = 0
+
+        for i, val in enumerate(h_proj):
+            if val > threshold and not in_line:
+                in_line = True
+                line_start = i
+            elif val <= threshold and in_line:
+                in_line = False
+                if i - line_start >= 10:  # Minimum line height
+                    lines.append((line_start, i))
+
+        if in_line and h - line_start >= 10:
+            lines.append((line_start, h))
+
+        # If only one line detected, return as-is
+        if len(lines) <= 1:
+            return [(region, 0)]
+
+        # Split into sub-regions with some padding
+        sub_regions = []
+        for y1, y2 in lines:
+            # Add small padding
+            y1_pad = max(0, y1 - 2)
+            y2_pad = min(h, y2 + 2)
+            sub_region = region.crop((0, y1_pad, w, y2_pad))
+            sub_regions.append((sub_region, y1_pad))
+
+        return sub_regions
 
     def _ocr_fallback(self, image):
         """备选方案：投影法检测"""
