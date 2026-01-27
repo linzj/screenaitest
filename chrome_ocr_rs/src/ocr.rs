@@ -350,7 +350,7 @@ impl ChromeOCR {
                         let x_dist = (other.1 - g.1).abs();
                         let y_dist = (other.2 - g.2).abs();
                         let x_thresh = other.3 + g.3;
-                        let y_thresh = (other.4 + g.4) * 0.3;
+                        let y_thresh = (other.4 + g.4) * 0.35;
 
                         if x_dist < x_thresh && y_dist < y_thresh {
                             group.push(j);
@@ -389,8 +389,8 @@ impl ChromeOCR {
             }
         }
 
-        // Apply NMS to remove overlapping boxes
-        self.nms_merged_boxes(merged, 0.3)
+        // Apply NMS to remove overlapping boxes (use 0.5 threshold like Python)
+        self.nms_merged_boxes(merged, 0.5)
     }
 
     /// Apply NMS to merged boxes
