@@ -329,8 +329,8 @@ class LineRecognizer:
             return ("", 0.0) if return_conf else ""
 
         # Calculate ideal width when scaled to height 32
-        # Use 160 as effective width (168 - 8px left margin for edge recognition)
-        effective_width = 160
+        # Use 156 as effective width (168 - 12px left margin for edge recognition)
+        effective_width = 156
         ideal_w = int(w * 32 / h)
 
         if ideal_w <= effective_width:
@@ -392,8 +392,8 @@ class LineRecognizer:
 
         # Scale to height 32, width proportionally
         scale = 32 / h
-        # Leave 8px left margin to avoid edge recognition issues
-        left_margin = 8
+        # Leave 12px left margin to avoid edge recognition issues
+        left_margin = 12
         new_w = min(int(w * scale), 168 - left_margin)
         new_h = 32
 
