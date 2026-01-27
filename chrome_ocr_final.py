@@ -328,16 +328,18 @@ class LineRecognizer:
         if w < 5 or h < 5:
             return ("", 0.0) if return_conf else ""
 
-        # 计算理想宽度：使高度缩放到32时的对应宽度
+        # Calculate ideal width when scaled to height 32
+        # Use 160 as effective width (168 - 8px left margin for edge recognition)
+        effective_width = 160
         ideal_w = int(w * 32 / h)
 
-        if ideal_w <= 168:
-            # 短行：直接缩放padding识别
+        if ideal_w <= effective_width:
+            # Short line: direct recognition
             text, conf = self._recognize_segment(image)
             return (text, conf) if return_conf else text
         else:
             # Long line: segment recognition with overlap deduplication
-            seg_w = int(168 * h / 32)
+            seg_w = int(effective_width * h / 32)
             step = int(seg_w * 0.7)
 
             segments = []
@@ -388,16 +390,18 @@ class LineRecognizer:
         """识别单个片段，返回(文字, 置信度)"""
         w, h = image.size
 
-        # 缩放到高度32，宽度按比例
+        # Scale to height 32, width proportionally
         scale = 32 / h
-        new_w = min(int(w * scale), 168)
+        # Leave 8px left margin to avoid edge recognition issues
+        left_margin = 8
+        new_w = min(int(w * scale), 168 - left_margin)
         new_h = 32
 
         scaled = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-        # Padding到168x32
+        # Padding to 168x32 with left margin
         canvas = Image.new('L', (168, 32), 255)
-        canvas.paste(scaled, (0, 0))
+        canvas.paste(scaled, (left_margin, 0))
 
         return self._recognize_canvas(canvas)
 
