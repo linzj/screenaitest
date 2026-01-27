@@ -6,15 +6,13 @@ use tflitec::model::Model;
 
 use crate::utils::BBox;
 
-const TARGET_SIZE: u32 = 4096;
-
 pub struct TextDetector {
     model: Model<'static>,
-    #[allow(dead_code)]
     input_sizes: Vec<usize>,
     pub scale: f32,
     pub offset_x: f32,
     pub offset_y: f32,
+    pub target_size: u32,
 }
 
 impl TextDetector {
@@ -62,37 +60,63 @@ impl TextDetector {
             scale: 1.0,
             offset_x: 0.0,
             offset_y: 0.0,
+            target_size: 0,
         })
     }
 
-    /// Preprocess image to 4096x4096 grayscale
+    /// Find the best input size for the given image dimensions
+    fn find_best_input_size(&self, width: u32, height: u32) -> u32 {
+        let max_dim = width.max(height) as usize;
+        // Find the smallest input size that can contain the image
+        for &size in &self.input_sizes {
+            if size >= max_dim {
+                return size as u32;
+            }
+        }
+        // If image is larger than all inputs, use the largest
+        *self.input_sizes.last().unwrap_or(&4096) as u32
+    }
+
+    /// Preprocess image - scale to fit the best input size
     fn preprocess(&mut self, image: &GrayImage) -> GrayImage {
         let (w, h) = (image.width(), image.height());
-
-        // Calculate scale to fit in 4096x4096
         let max_dim = w.max(h);
-        self.scale = TARGET_SIZE as f32 / max_dim as f32;
+
+        // Find the best input size for this image
+        self.target_size = self.find_best_input_size(w, h);
+
+        // Calculate scale: if image fits, scale up; if not, keep scale=1.0
+        if max_dim <= self.target_size {
+            // Image fits - scale up to fill target size
+            self.scale = self.target_size as f32 / max_dim as f32;
+        } else {
+            // Image larger than all inputs - no resize
+            self.scale = 1.0;
+        }
+
         let new_w = (w as f32 * self.scale) as u32;
         let new_h = (h as f32 * self.scale) as u32;
 
-        // Center the image
-        self.offset_x = (TARGET_SIZE - new_w) as f32 / 2.0;
-        self.offset_y = (TARGET_SIZE - new_h) as f32 / 2.0;
+        // Center the image in the target canvas
+        self.offset_x = (self.target_size - new_w) as f32 / 2.0;
+        self.offset_y = (self.target_size - new_h) as f32 / 2.0;
 
-        // Create 4096x4096 canvas with white background
+        // Create canvas with white background
         let mut canvas: GrayImage =
-            ImageBuffer::from_pixel(TARGET_SIZE, TARGET_SIZE, Luma([255u8]));
+            ImageBuffer::from_pixel(self.target_size, self.target_size, Luma([255u8]));
 
-        // Resize and paste
-        let resized =
-            image::imageops::resize(image, new_w, new_h, image::imageops::FilterType::Lanczos3);
-
-        image::imageops::overlay(
-            &mut canvas,
-            &resized,
-            self.offset_x as i64,
-            self.offset_y as i64,
-        );
+        // Resize if needed and paste
+        if self.scale != 1.0 {
+            let resized = image::imageops::resize(
+                image,
+                new_w,
+                new_h,
+                image::imageops::FilterType::Lanczos3,
+            );
+            image::imageops::overlay(&mut canvas, &resized, self.offset_x as i64, self.offset_y as i64);
+        } else {
+            image::imageops::overlay(&mut canvas, image, self.offset_x as i64, self.offset_y as i64);
+        }
 
         canvas
     }
@@ -150,19 +174,20 @@ impl TextDetector {
                 // Get output data as f32
                 let data: &[f32] = tensor.data();
 
+                let target = self.target_size as f32;
                 for y in 0..feat_h {
                     for x in 0..feat_w {
                         let idx = (y * feat_w + x) * 7;
                         let conf = data[idx];
 
                         if conf > threshold {
-                            // Calculate center position in 4096 space
-                            let cx = (x as f32 + 0.5) * TARGET_SIZE as f32 / feat_w as f32;
-                            let cy = (y as f32 + 0.5) * TARGET_SIZE as f32 / feat_h as f32;
-                            let bw = TARGET_SIZE as f32 / feat_w as f32 * 1.2;
-                            let bh = TARGET_SIZE as f32 / feat_h as f32 * 1.2;
+                            // Calculate center position in target_size space
+                            let cx = (x as f32 + 0.5) * target / feat_w as f32;
+                            let cy = (y as f32 + 0.5) * target / feat_h as f32;
+                            let bw = target / feat_w as f32 * 1.2;
+                            let bh = target / feat_h as f32 * 1.2;
 
-                            // Check if within content area
+                            // Check if within content area (account for scale)
                             let scaled_w = image.width() as f32 * self.scale;
                             let scaled_h = image.height() as f32 * self.scale;
 

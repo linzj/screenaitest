@@ -9,7 +9,6 @@ use crate::sorter::LayoutSorter;
 use crate::utils::{calc_containment, calc_iou, calc_xy_overlap, BBox};
 
 const MIN_HEIGHT: u32 = 40;
-const TARGET_SIZE: u32 = 4096;
 
 #[derive(Default)]
 pub struct PerfStats {
@@ -116,15 +115,15 @@ impl ChromeOCR {
         println!("Image: {}x{}", width, height);
 
         // Step 1: Text Detection
-        println!(
-            "\n[1/3] Text Detection (on {}x{})...",
-            TARGET_SIZE, TARGET_SIZE
-        );
         let t0 = Instant::now();
         let boxes = self.detector.detect(&image, 0.5)?;
         self.stats.detection = t0.elapsed().as_secs_f64();
+        let target_size = self.detector.target_size;
+        println!(
+            "\n[1/3] Text Detection (on {}x{})...",
+            target_size, target_size
+        );
         println!("  Found {} char-level regions", boxes.len());
-        println!("  Scale factor: {:.2}x", self.detector.scale);
 
         // Merge boxes to lines
         let t1 = Instant::now();
@@ -135,7 +134,7 @@ impl ChromeOCR {
         // Step 2: Layout Sorting
         println!("\n[2/3] Layout Sorting...");
         let t2 = Instant::now();
-        let sorted_lines = self.sorter.sort(&merged, (TARGET_SIZE, TARGET_SIZE))?;
+        let sorted_lines = self.sorter.sort(&merged, (target_size, target_size))?;
         self.stats.sorting = t2.elapsed().as_secs_f64();
 
         // Step 3: Line Recognition
@@ -170,7 +169,8 @@ impl ChromeOCR {
         let rec_interpreter = self.recognizer.create_interpreter()?;
 
         for bbox in &sorted_lines {
-            // Convert 4096 coordinates to original image coordinates
+            // Convert padded coordinates to original image coordinates
+            // Subtract offset, then divide by scale
             let mut x1 = ((bbox.x1 - offset_x) / scale) as i32;
             let mut y1 = ((bbox.y1 - offset_y) / scale) as i32;
             let mut x2 = ((bbox.x2 - offset_x) / scale) as i32;
