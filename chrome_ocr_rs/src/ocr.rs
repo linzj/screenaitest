@@ -145,17 +145,14 @@ impl ChromeOCR {
         let offset_x = self.detector.offset_x;
         let offset_y = self.detector.offset_y;
 
-        // Create output directory for line images
+        // Create output directory for line images (in current directory like Python)
         let lines_dir = if self.save_lines {
             let stem = image_path
                 .file_stem()
                 .unwrap_or_default()
                 .to_str()
                 .unwrap_or("output");
-            let dir = image_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(format!("{}_lines", stem));
+            let dir = Path::new(".").join(format!("{}_lines", stem));
             std::fs::create_dir_all(&dir)?;
             println!("  Saving line images to: {}/", dir.display());
             Some(dir)
@@ -350,7 +347,7 @@ impl ChromeOCR {
                         let x_dist = (other.1 - g.1).abs();
                         let y_dist = (other.2 - g.2).abs();
                         let x_thresh = other.3 + g.3;
-                        let y_thresh = (other.4 + g.4) * 0.35;
+                        let y_thresh = (other.4 + g.4) * 0.3; // Match Python
 
                         if x_dist < x_thresh && y_dist < y_thresh {
                             group.push(j);
@@ -389,7 +386,7 @@ impl ChromeOCR {
             }
         }
 
-        // Apply NMS to remove overlapping boxes (use 0.5 threshold like Python)
+        // Apply NMS to remove overlapping boxes (like Python: iou_threshold=0.5)
         self.nms_merged_boxes(merged, 0.5)
     }
 
