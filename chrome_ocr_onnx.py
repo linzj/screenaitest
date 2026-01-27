@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Chrome Screen AI OCR - ONNX DirectML Version
-检测和排序使用TFLite (CPU), 识别使用ONNX+DirectML (GPU)
+支持ONNX和TFLite两种模式的性能对比
 """
 
 import os
@@ -19,6 +19,158 @@ warnings.filterwarnings('ignore')
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# 全局选项
+USE_ONNX_DETECTION = '--onnx-detect' in sys.argv
+
+
+class TextDetectorONNX:
+    """文本检测模型 - ONNX版本，支持 DirectML"""
+
+    def __init__(self, onnx_path, verbose=False):
+        import onnxruntime as ort
+        self.ort = ort
+
+        # 选择执行器
+        providers = ort.get_available_providers()
+        self.use_dml = 'DmlExecutionProvider' in providers and '--cpu' not in sys.argv
+        if self.use_dml:
+            self.session = ort.InferenceSession(
+                str(onnx_path),
+                providers=['DmlExecutionProvider', 'CPUExecutionProvider']
+            )
+            self.device = 'DirectML'
+        else:
+            self.session = ort.InferenceSession(
+                str(onnx_path),
+                providers=['CPUExecutionProvider']
+            )
+            self.device = 'CPU'
+
+        self.input_names = {inp.shape[1]: inp.name for inp in self.session.get_inputs()}
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.verbose = verbose
+        print(f"  TextDetector [ONNX/{self.device}]: scales {sorted(self.input_names.keys())}")
+
+    def detect(self, image, threshold=0.3):
+        """同步检测（兼容旧接口）"""
+        inputs, metadata = self._preprocess_image(image)
+        io_binding = self._submit_inference(inputs)
+        return self._get_result_and_decode(io_binding, threshold, metadata)
+
+    def _preprocess_image(self, image):
+        """预处理图像，返回模型输入和元数据"""
+        gray = image.convert('L')
+        orig_w, orig_h = image.size
+
+        max_dim = max(orig_w, orig_h)
+        scale = 4096 / max_dim
+        scaled_w = int(orig_w * scale)
+        scaled_h = int(orig_h * scale)
+        scaled_img = gray.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+
+        img_4096 = Image.new('L', (4096, 4096), 255)
+        offset_x = (4096 - scaled_w) // 2
+        offset_y = (4096 - scaled_h) // 2
+        img_4096.paste(scaled_img, (offset_x, offset_y))
+
+        # 保存到 self 供后续使用
+        self.img_4096 = img_4096
+        self.scale = scale
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+
+        # 准备输入
+        inputs = {}
+        for size, name in self.input_names.items():
+            resized = img_4096.resize((size, size), Image.Resampling.BILINEAR)
+            arr = np.array(resized, dtype=np.uint8).reshape(1, size, size, 1)
+            arr = np.ascontiguousarray(arr)
+            inputs[name] = arr
+
+        metadata = {
+            'scale': scale,
+            'scaled_w': scaled_w,
+            'scaled_h': scaled_h,
+            'offset_x': offset_x,
+            'offset_y': offset_y
+        }
+        return inputs, metadata
+
+    def _submit_inference(self, inputs):
+        """Phase 1: 提交推理请求，返回 IOBinding"""
+        io_binding = self.session.io_binding()
+
+        # 绑定所有输入
+        for name, arr in inputs.items():
+            io_binding.bind_cpu_input(name, arr)
+
+        # 绑定输出
+        if self.use_dml:
+            for output_name in self.output_names:
+                io_binding.bind_output(output_name, 'dml', 0)
+        else:
+            for output_name in self.output_names:
+                io_binding.bind_output(output_name, 'cpu', 0)
+
+        # 运行推理
+        self.session.run_with_iobinding(io_binding)
+        return io_binding
+
+    def _get_result_and_decode(self, io_binding, threshold, metadata):
+        """Phase 2+3: 获取输出并解码为检测框"""
+        if self.use_dml:
+            io_binding.synchronize_outputs()
+            outputs = io_binding.copy_outputs_to_cpu()
+        else:
+            outputs = io_binding.copy_outputs_to_cpu()
+
+        return self._decode_boxes(outputs, threshold, metadata)
+
+    def _decode_boxes(self, outputs, threshold, metadata):
+        """解码输出为检测框"""
+        offset_x = metadata['offset_x']
+        offset_y = metadata['offset_y']
+        scaled_w = metadata['scaled_w']
+        scaled_h = metadata['scaled_h']
+
+        boxes = []
+        for tensor in outputs:
+            if len(tensor.shape) == 4 and tensor.shape[-1] == 7:
+                feat_h, feat_w = tensor.shape[1], tensor.shape[2]
+                conf = tensor[0, :, :, 0]
+                ys, xs = np.where(conf > threshold)
+                for y, x in zip(ys, xs):
+                    c = float(conf[y, x])
+                    cx = (x + 0.5) * 4096 / feat_w
+                    cy = (y + 0.5) * 4096 / feat_h
+                    bw = 4096 / feat_w * 1.2
+                    bh = 4096 / feat_h * 1.2
+                    if offset_x < cx < offset_x + scaled_w and offset_y < cy < offset_y + scaled_h:
+                        boxes.append({
+                            'bbox': [cx - bw/2, cy - bh/2, cx + bw/2, cy + bh/2],
+                            'conf': c, 'in_4096': True
+                        })
+
+        boxes = sorted(boxes, key=lambda x: -x['conf'])
+        kept = []
+        for box in boxes:
+            overlap = False
+            for k in kept:
+                if self._iou(box['bbox'], k['bbox']) > 0.3:
+                    overlap = True
+                    break
+            if not overlap:
+                kept.append(box)
+        return kept
+
+    def _iou(self, b1, b2):
+        x1, y1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+        x2, y2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+        inter = max(0, x2-x1) * max(0, y2-y1)
+        a1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
+        a2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
+        return inter / (a1 + a2 - inter + 1e-6)
 
 
 class TextDetector:
@@ -143,15 +295,16 @@ class LayoutSorter:
 
 
 class LineRecognizerONNX:
-    """行识别模型 - ONNX DirectML版本"""
+    """行识别模型 - ONNX DirectML版本，支持分阶段计算"""
 
     def __init__(self, onnx_path, char_map_path, verbose=False):
         import onnxruntime as ort
+        self.ort = ort
 
         # 选择执行器
         providers = ort.get_available_providers()
-        use_dml = 'DmlExecutionProvider' in providers and '--cpu' not in sys.argv
-        if use_dml:
+        self.use_dml = 'DmlExecutionProvider' in providers and '--cpu' not in sys.argv
+        if self.use_dml:
             self.session = ort.InferenceSession(
                 str(onnx_path),
                 providers=['DmlExecutionProvider', 'CPUExecutionProvider']
@@ -165,6 +318,7 @@ class LineRecognizerONNX:
             self.device = 'CPU'
 
         self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [out.name for out in self.session.get_outputs()]
         self.char_map = self._load_char_map(char_map_path)
         self.verbose = verbose
 
@@ -219,10 +373,89 @@ class LineRecognizerONNX:
         canvas.paste(scaled, (0, 0))
         return self._recognize_canvas(canvas)
 
-    def _recognize_canvas(self, canvas):
-        input_data = np.array(canvas, dtype=np.uint8).reshape(1, 32, 168, 1)
-        outputs = self.session.run(None, {self.input_name: input_data})
+    def _prepare_canvas(self, image):
+        """将图像预处理为 canvas，用于批量识别"""
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
+        if image.mode != 'L':
+            image = image.convert('L')
 
+        w, h = image.size
+        if w < 5 or h < 5:
+            return None
+
+        scale = 32 / h
+        new_w = min(int(w * scale), 168)
+        scaled = image.resize((new_w, 32), Image.Resampling.LANCZOS)
+        canvas = Image.new('L', (168, 32), 255)
+        canvas.paste(scaled, (0, 0))
+        return canvas
+
+    def recognize_batch(self, images):
+        """批量识别：Phase 1 批量提交，Phase 2+3 逐个获取解码"""
+        # Phase 1: 预处理并批量提交
+        bindings = []
+        valid_indices = []
+        for i, image in enumerate(images):
+            canvas = self._prepare_canvas(image)
+            if canvas is not None:
+                binding = self._submit_inference(canvas)
+                bindings.append(binding)
+                valid_indices.append(i)
+
+        # Phase 2+3: 逐个获取结果并解码
+        results = [("", 0.0)] * len(images)
+        for idx, binding in zip(valid_indices, bindings):
+            text, conf = self._get_result_and_decode(binding)
+            results[idx] = (text, conf)
+
+        return results
+
+    def _recognize_canvas(self, canvas):
+        """同步识别（兼容旧接口）"""
+        io_binding = self._submit_inference(canvas)
+        return self._get_result_and_decode(io_binding)
+
+    def _submit_inference(self, canvas):
+        """Phase 1: 提交推理请求，返回 IOBinding 供后续获取结果"""
+        input_data = np.array(canvas, dtype=np.uint8).reshape(1, 32, 168, 1)
+        input_data = np.ascontiguousarray(input_data)
+
+        # 为每次推理创建独立的 IOBinding
+        io_binding = self.session.io_binding()
+
+        # 绑定输入（CPU numpy array）
+        io_binding.bind_cpu_input(self.input_name, input_data)
+
+        if self.use_dml:
+            # DirectML: 绑定输出到 GPU，避免自动复制
+            for output_name in self.output_names:
+                io_binding.bind_output(output_name, 'dml', 0)
+        else:
+            # CPU: 绑定输出到 CPU
+            for output_name in self.output_names:
+                io_binding.bind_output(output_name, 'cpu', 0)
+
+        # 运行推理（DirectML 时快速返回，输出留在 GPU）
+        self.session.run_with_iobinding(io_binding)
+
+        return io_binding
+
+    def _get_result_and_decode(self, io_binding):
+        """Phase 2+3: 获取输出并立即进行 CTC 解码"""
+        if self.use_dml:
+            # DirectML: 同步等待 GPU 完成，然后复制到 CPU
+            io_binding.synchronize_outputs()
+            outputs = io_binding.copy_outputs_to_cpu()
+        else:
+            # CPU: 直接获取输出
+            outputs = io_binding.copy_outputs_to_cpu()
+
+        # Phase 3: CTC 解码（与 Phase 2 融合）
+        return self._ctc_decode(outputs)
+
+    def _ctc_decode(self, outputs):
+        """CTC 解码"""
         # 找到logits输出 (shape: [1, 42, 8179])
         logits = None
         for out in outputs:
@@ -285,7 +518,13 @@ class ChromeOCR_ONNX:
         print("Loading models...")
 
         t0 = time.perf_counter()
-        self.detector = TextDetector(self.model_dir, verbose)
+        if USE_ONNX_DETECTION:
+            onnx_detect_path = script_dir / 'onnx_models' / 'detection_uint8.onnx'
+            self.detector = TextDetectorONNX(onnx_detect_path, verbose)
+            self.detector_type = 'ONNX'
+        else:
+            self.detector = TextDetector(self.model_dir, verbose)
+            self.detector_type = 'TFLite'
         t1 = time.perf_counter()
         self.sorter = LayoutSorter(self.model_dir, verbose)
         t2 = time.perf_counter()
@@ -304,11 +543,12 @@ class ChromeOCR_ONNX:
         if not self.perf_stats:
             return
         print("\n" + "=" * 50)
-        print("Performance Statistics (ONNX DirectML)")
+        print(f"Performance Statistics (Detection: {self.detector_type})")
         print("=" * 50)
         if 'load_total' in self.perf_stats:
             print("\n[Model Loading]")
-            print(f"  TextDetector:   {self.perf_stats.get('load_detector', 0)*1000:7.1f} ms (TFLite/CPU)")
+            detector_device = getattr(self.detector, 'device', 'CPU')
+            print(f"  TextDetector:   {self.perf_stats.get('load_detector', 0)*1000:7.1f} ms ({self.detector_type}/{detector_device})")
             print(f"  LayoutSorter:   {self.perf_stats.get('load_sorter', 0)*1000:7.1f} ms (TFLite/CPU)")
             print(f"  LineRecognizer: {self.perf_stats.get('load_recognizer', 0)*1000:7.1f} ms (ONNX/{self.recognizer.device})")
             print(f"  Total:          {self.perf_stats.get('load_total', 0)*1000:7.1f} ms")
@@ -330,7 +570,8 @@ class ChromeOCR_ONNX:
         print(f"Image: {image.size}")
 
         if use_detection:
-            print("\n[1/3] Text Detection (TFLite/CPU)...")
+            detector_device = getattr(self.detector, 'device', 'CPU')
+            print(f"\n[1/3] Text Detection ({self.detector_type}/{detector_device})...")
             t0 = time.perf_counter()
             boxes = self.detector.detect(image, threshold=0.5)
             t1 = time.perf_counter()
@@ -357,15 +598,18 @@ class ChromeOCR_ONNX:
             if self.perf:
                 self.perf_stats['sorting'] = t1 - t0
 
-            print(f"\n[3/3] Line Recognition (ONNX/{self.recognizer.device})...")
+            batch_mode = '--batch' in sys.argv
+            print(f"\n[3/3] Line Recognition (ONNX/{self.recognizer.device}, {'batch' if batch_mode else 'sequential'})...")
             results = []
             orig_gray = Image.open(image_path).convert('L')
             scale = self.detector.scale
             offset_x = self.detector.offset_x
             offset_y = self.detector.offset_y
             min_conf = 0.3
-            rec_times = []
 
+            # 预处理所有区域
+            regions = []
+            region_info = []  # (index, y1)
             for i, box in enumerate(sorted_lines):
                 b = box['bbox']
                 x1 = int((b[0] - offset_x) / scale)
@@ -379,20 +623,31 @@ class ChromeOCR_ONNX:
                     continue
 
                 region = orig_gray.crop((x1, y1, x2, y2))
-                t0 = time.perf_counter()
-                text, conf = self.recognizer.recognize(region, return_conf=True)
-                t1 = time.perf_counter()
-                rec_times.append(t1 - t0)
+                regions.append(region)
+                region_info.append((i, y1))
 
-                if text.strip() and conf >= min_conf:
-                    print(f"  L{i+1} (y={y1:4d}) conf={conf:.2f}: {text}")
-                    results.append(text)
+            t0 = time.perf_counter()
+            if batch_mode:
+                # 批量模式：Phase 1 全部提交，Phase 2+3 逐个解码
+                batch_results = self.recognizer.recognize_batch(regions)
+                for (i, y1), (text, conf) in zip(region_info, batch_results):
+                    if text.strip() and conf >= min_conf:
+                        print(f"  L{i+1} (y={y1:4d}) conf={conf:.2f}: {text}")
+                        results.append(text)
+            else:
+                # 顺序模式：逐个识别
+                for (i, y1), region in zip(region_info, regions):
+                    text, conf = self.recognizer.recognize(region, return_conf=True)
+                    if text.strip() and conf >= min_conf:
+                        print(f"  L{i+1} (y={y1:4d}) conf={conf:.2f}: {text}")
+                        results.append(text)
+            t1 = time.perf_counter()
 
             ocr_end = time.perf_counter()
             if self.perf:
-                self.perf_stats['recognition_total'] = sum(rec_times)
-                self.perf_stats['recognition_count'] = len(rec_times)
-                self.perf_stats['recognition_avg'] = sum(rec_times) / len(rec_times) if rec_times else 0
+                self.perf_stats['recognition_total'] = t1 - t0
+                self.perf_stats['recognition_count'] = len(regions)
+                self.perf_stats['recognition_avg'] = (t1 - t0) / len(regions) if regions else 0
                 self.perf_stats['ocr_total'] = ocr_end - ocr_start
 
             return results
@@ -450,16 +705,17 @@ def main():
     if len(sys.argv) < 2 or '--help' in sys.argv or '-h' in sys.argv:
         print("Chrome Screen AI OCR - ONNX DirectML Version")
         print("=" * 50)
-        print("使用ONNX Runtime + DirectML进行GPU加速识别")
+        print("使用ONNX Runtime进行推理，支持TFLite/ONNX检测模型对比")
         print()
         print("Usage:")
         print("  python chrome_ocr_onnx.py <image>")
         print("  python chrome_ocr_onnx.py <image> --perf")
-        print("  python chrome_ocr_onnx.py <image> --cpu")
+        print("  python chrome_ocr_onnx.py <image> --onnx-detect --perf")
         print()
         print("Options:")
-        print("  --perf    显示性能统计")
-        print("  --cpu     强制使用CPU (比DirectML更快)")
+        print("  --perf         显示性能统计")
+        print("  --cpu          强制识别使用CPU")
+        print("  --onnx-detect  使用ONNX检测模型 (默认TFLite)")
         return
 
     image_path = sys.argv[1]
