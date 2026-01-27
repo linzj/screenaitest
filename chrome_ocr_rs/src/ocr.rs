@@ -268,7 +268,9 @@ impl ChromeOCR {
                 rec_count += 1;
                 let (text, conf) = self.recognizer.recognize_with_interpreter(&sub_region, &rec_interpreter)?;
 
-                if !text.trim().is_empty() && conf >= self.min_conf {
+                // Filter out very short fragments (likely noise)
+                let text_len = text.chars().count();
+                if text_len >= 2 && conf >= self.min_conf {
                     line_num += 1;
                     recognized_lines.push((x1, actual_y, sub_w, sub_h, conf));
 
@@ -387,7 +389,13 @@ impl ChromeOCR {
         }
 
         // Apply NMS to remove overlapping boxes (like Python: iou_threshold=0.5)
-        self.nms_merged_boxes(merged, 0.5)
+        let after_nms = self.nms_merged_boxes(merged, 0.5);
+
+        // Filter out tiny fragments (width < 100 in 4096 space is too small for meaningful text)
+        after_nms
+            .into_iter()
+            .filter(|b| b.width() >= 100.0)
+            .collect()
     }
 
     /// Apply NMS to merged boxes
