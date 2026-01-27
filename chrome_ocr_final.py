@@ -608,6 +608,8 @@ class ChromeOCR:
                 print(f"  Saving line images to: {lines_dir}/")
 
             line_num = 0
+            recognized_lines = []  # Track (y, height, text) to deduplicate
+
             for i, box in enumerate(sorted_lines):
                 b = box['bbox']
                 # Convert 4096 coordinates back to original image coordinates
@@ -637,6 +639,28 @@ class ChromeOCR:
                 sub_regions = self._split_multiline_region(region)
 
                 for sub_idx, (sub_region, sub_y_offset) in enumerate(sub_regions):
+                    actual_y = y1 + sub_y_offset
+                    sub_h = sub_region.size[1]
+                    sub_w = sub_region.size[0]
+
+                    # Check for duplicate lines (similar y AND x position)
+                    is_duplicate = False
+                    for prev_x, prev_y, prev_w, prev_h, prev_conf in recognized_lines:
+                        y_overlap = max(0, min(actual_y + sub_h, prev_y + prev_h) - max(actual_y, prev_y))
+                        x_overlap = max(0, min(x1 + sub_w, prev_x + prev_w) - max(x1, prev_x))
+                        min_h = min(sub_h, prev_h)
+                        min_w = min(sub_w, prev_w)
+                        # Both y and x must overlap significantly
+                        if min_h > 0 and min_w > 0:
+                            y_ratio = y_overlap / min_h
+                            x_ratio = x_overlap / min_w
+                            if y_ratio > 0.5 and x_ratio > 0.5:
+                                is_duplicate = True
+                                break
+
+                    if is_duplicate:
+                        continue
+
                     t0 = time.perf_counter()
                     text, conf = self.recognizer.recognize(sub_region, return_conf=True)
                     t1 = time.perf_counter()
@@ -644,7 +668,7 @@ class ChromeOCR:
 
                     if text.strip() and conf >= min_conf:
                         line_num += 1
-                        actual_y = y1 + sub_y_offset
+                        recognized_lines.append((x1, actual_y, sub_w, sub_h, conf))
                         # Save line image if save_lines is enabled
                         if self.save_lines and lines_dir:
                             line_path = Path(lines_dir) / f'line_{line_num:03d}.png'
@@ -735,17 +759,46 @@ class ChromeOCR:
         for box in boxes:
             # Check if this box overlaps too much with any kept box
             dominated = False
+            b = box['bbox']
             for k in kept:
-                iou = self._calc_iou(box['bbox'], k['bbox'])
-                # Also check if box is mostly contained in k
-                containment = self._calc_containment(box['bbox'], k['bbox'])
-                if iou > iou_threshold or containment > 0.7:
+                kb = k['bbox']
+                iou = self._calc_iou(b, kb)
+                # Check containment in both directions
+                containment1 = self._calc_containment(b, kb)  # box in k
+                containment2 = self._calc_containment(kb, b)  # k in box
+                # Check y-overlap ratio (for horizontal text lines)
+                y_overlap = self._calc_y_overlap(b, kb)
+                if iou > iou_threshold or containment1 > 0.6 or containment2 > 0.6 or y_overlap > 0.5:
                     dominated = True
                     break
             if not dominated:
                 kept.append(box)
 
         return kept
+
+    def _calc_y_overlap(self, b1, b2):
+        """Calculate vertical overlap ratio between two boxes."""
+        y1 = max(b1[1], b2[1])
+        y2 = min(b1[3], b2[3])
+        y_overlap = max(0, y2 - y1)
+        h1 = b1[3] - b1[1]
+        h2 = b2[3] - b2[1]
+        min_h = min(h1, h2)
+        y_ratio = y_overlap / (min_h + 1e-6) if min_h > 0 else 0
+
+        # Also check x-overlap
+        x1 = max(b1[0], b2[0])
+        x2 = min(b1[2], b2[2])
+        x_overlap = max(0, x2 - x1)
+        w1 = b1[2] - b1[0]
+        w2 = b2[2] - b2[0]
+        min_w = min(w1, w2)
+        x_ratio = x_overlap / (min_w + 1e-6) if min_w > 0 else 0
+
+        # Return combined overlap - both x and y must overlap significantly
+        if y_ratio > 0.5 and x_ratio > 0.5:
+            return max(y_ratio, x_ratio)
+        return 0
 
     def _calc_containment(self, b1, b2):
         """Calculate how much of b1 is contained in b2."""
