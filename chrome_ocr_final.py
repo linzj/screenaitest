@@ -336,23 +336,53 @@ class LineRecognizer:
             text, conf = self._recognize_segment(image)
             return (text, conf) if return_conf else text
         else:
-            # 长行：分段识别
+            # Long line: segment recognition with overlap deduplication
             seg_w = int(168 * h / 32)
             step = int(seg_w * 0.7)
 
-            results = []
+            segments = []
             confs = []
             for x in range(0, w - seg_w // 2, step):
                 x2 = min(x + seg_w, w)
                 seg = image.crop((x, 0, x2, h))
                 text, conf = self._recognize_segment(seg)
                 if text:
-                    results.append(text)
+                    segments.append(text)
                     confs.append(conf)
 
-            combined = ' '.join(results)
+            # Merge segments with overlap deduplication
+            combined = self._merge_overlapping_segments(segments)
             avg_conf = float(np.mean(confs)) if confs else 0.0
             return (combined, avg_conf) if return_conf else combined
+
+    def _merge_overlapping_segments(self, segments):
+        """Merge overlapping text segments by finding and removing duplicates"""
+        if not segments:
+            return ""
+        if len(segments) == 1:
+            return segments[0]
+
+        result = segments[0]
+        for i in range(1, len(segments)):
+            next_seg = segments[i]
+            # Find the overlap between end of result and start of next_seg
+            overlap_len = self._find_overlap(result, next_seg)
+            if overlap_len > 0:
+                # Append only the non-overlapping part
+                result += next_seg[overlap_len:]
+            else:
+                # No overlap found, just concatenate
+                result += next_seg
+        return result
+
+    def _find_overlap(self, s1, s2):
+        """Find the length of overlap between end of s1 and start of s2"""
+        # Try to find the longest suffix of s1 that matches a prefix of s2
+        max_overlap = min(len(s1), len(s2))
+        for overlap_len in range(max_overlap, 0, -1):
+            if s1[-overlap_len:] == s2[:overlap_len]:
+                return overlap_len
+        return 0
 
     def _recognize_segment(self, image):
         """识别单个片段，返回(文字, 置信度)"""
@@ -423,9 +453,10 @@ class LineRecognizer:
 class ChromeOCR:
     """Chrome Screen AI OCR Pipeline - 使用所有模型"""
 
-    def __init__(self, verbose=False, perf=False):
+    def __init__(self, verbose=False, perf=False, save_lines=False):
         self.verbose = verbose
         self.perf = perf
+        self.save_lines = save_lines
         self.perf_stats = {}  # 存储性能统计
 
         screen_ai_path = Path(os.environ.get('LOCALAPPDATA', '')) / 'Google/Chrome/User Data/screen_ai'
@@ -565,6 +596,14 @@ class ChromeOCR:
             min_conf = 0.3  # 置信度阈值
             rec_times = []
 
+            # Create output directory for line images if save_lines is enabled
+            lines_dir = None
+            if self.save_lines:
+                lines_dir = Path(image_path).stem + '_lines'
+                os.makedirs(lines_dir, exist_ok=True)
+                print(f"  Saving line images to: {lines_dir}/")
+
+            line_num = 0
             for i, box in enumerate(sorted_lines):
                 b = box['bbox']
                 # 4096坐标转回原图坐标
@@ -587,7 +626,12 @@ class ChromeOCR:
                 rec_times.append(t1 - t0)
 
                 if text.strip() and conf >= min_conf:
-                    print(f"  L{i+1} (y={y1:4d}) conf={conf:.2f}: {text}")
+                    line_num += 1
+                    # Save line image if save_lines is enabled
+                    if self.save_lines and lines_dir:
+                        line_path = Path(lines_dir) / f'line_{line_num:03d}.png'
+                        region.save(str(line_path))
+                    print(f"  L{line_num} (y={y1:4d}) conf={conf:.2f}: {text}")
                     results.append(text)
 
             ocr_end = time.perf_counter()
@@ -791,6 +835,7 @@ def main():
         print("  --fallback     使用投影法代替检测模型")
         print("  -v, --verbose  显示详细处理信息")
         print("  --perf         显示关键步骤耗时统计")
+        print("  --save-lines   保存每行裁剪图片到 <image>_lines/ 目录")
         return
 
     # 检查是否只打印模型信息
@@ -806,6 +851,7 @@ def main():
     use_detection = '--fallback' not in sys.argv
     verbose = '-v' in sys.argv or '--verbose' in sys.argv
     perf = '--perf' in sys.argv
+    save_lines = '--save-lines' in sys.argv
 
     if not os.path.exists(image_path):
         print(f"Error: {image_path} not found")
@@ -815,7 +861,7 @@ def main():
     print("Chrome Screen AI OCR")
     print("=" * 50)
 
-    ocr = ChromeOCR(verbose=verbose, perf=perf)
+    ocr = ChromeOCR(verbose=verbose, perf=perf, save_lines=save_lines)
 
     # 如果是详细模式，先打印模型信息
     if verbose:
