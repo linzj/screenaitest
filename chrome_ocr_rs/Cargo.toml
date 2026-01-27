@@ -36,3 +36,4 @@ libloading = "0.8"
 [profile.release]
 opt-level = 3
 lto = true
+debug = true
