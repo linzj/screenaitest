@@ -622,6 +622,14 @@ class ChromeOCR:
                 if x2 - x1 < 10 or y2 - y1 < 5:
                     continue
 
+                # Expand short lines vertically for better recognition
+                line_height = y2 - y1
+                min_height = 28  # Minimum height for good recognition
+                if line_height < min_height:
+                    expand = (min_height - line_height) // 2 + 2
+                    y1 = max(0, y1 - expand)
+                    y2 = min(orig_gray.height, y2 + expand)
+
                 # Crop region from original image
                 region = orig_gray.crop((x1, y1, x2, y2))
 
