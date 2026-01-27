@@ -626,9 +626,9 @@ class ChromeOCR:
 
                 # Expand short lines vertically for better recognition
                 line_height = y2 - y1
-                min_height = 28  # Minimum height for good recognition
+                min_height = 40  # Minimum height for good recognition
                 if line_height < min_height:
-                    expand = (min_height - line_height) // 2 + 2
+                    expand = (min_height - line_height) // 2 + 3
                     y1 = max(0, y1 - expand)
                     y2 = min(orig_gray.height, y2 + expand)
 
@@ -642,6 +642,15 @@ class ChromeOCR:
                     actual_y = y1 + sub_y_offset
                     sub_h = sub_region.size[1]
                     sub_w = sub_region.size[0]
+
+                    # Expand short sub-regions from original image
+                    if sub_h < min_height:
+                        expand_sub = (min_height - sub_h) // 2 + 3
+                        new_y1 = max(0, actual_y - expand_sub)
+                        new_y2 = min(orig_gray.height, actual_y + sub_h + expand_sub)
+                        sub_region = orig_gray.crop((x1, new_y1, x2, new_y2))
+                        actual_y = new_y1
+                        sub_h = sub_region.size[1]
 
                     # Check for duplicate lines (similar y AND x position)
                     is_duplicate = False
