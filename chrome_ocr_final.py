@@ -718,7 +718,51 @@ class ChromeOCR:
             if group:
                 merged.append(self._merge_row(group))
 
+        # NMS to remove highly overlapping boxes
+        merged = self._nms_merged_boxes(merged, iou_threshold=0.5)
+
         return merged
+
+    def _nms_merged_boxes(self, boxes, iou_threshold=0.3):
+        """Apply NMS to remove highly overlapping merged boxes."""
+        if len(boxes) <= 1:
+            return boxes
+
+        # Sort by confidence (higher first), then by area (larger first)
+        boxes = sorted(boxes, key=lambda x: (-x['conf'], -(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1])))
+
+        kept = []
+        for box in boxes:
+            # Check if this box overlaps too much with any kept box
+            dominated = False
+            for k in kept:
+                iou = self._calc_iou(box['bbox'], k['bbox'])
+                # Also check if box is mostly contained in k
+                containment = self._calc_containment(box['bbox'], k['bbox'])
+                if iou > iou_threshold or containment > 0.7:
+                    dominated = True
+                    break
+            if not dominated:
+                kept.append(box)
+
+        return kept
+
+    def _calc_containment(self, b1, b2):
+        """Calculate how much of b1 is contained in b2."""
+        x1, y1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+        x2, y2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+        return inter / (a1 + 1e-6)
+
+    def _calc_iou(self, b1, b2):
+        """Calculate IoU between two bounding boxes."""
+        x1, y1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+        x2, y2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+        a2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+        return inter / (a1 + a2 - inter + 1e-6)
 
     def _merge_row(self, row_boxes):
         """合并一行的所有框"""
