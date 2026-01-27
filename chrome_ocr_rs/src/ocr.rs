@@ -438,8 +438,8 @@ impl ChromeOCR {
     fn split_multiline_region(&self, region: &GrayImage) -> Vec<(GrayImage, u32)> {
         let (w, h) = (region.width(), region.height());
 
-        // Don't split short regions
-        if h < 60 {
+        // Don't split short regions (50px can contain ~2 lines of 25px each)
+        if h < 50 {
             return vec![(region.clone(), 0)];
         }
 

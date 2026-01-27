@@ -321,12 +321,13 @@ impl LineRecognizer {
         result
     }
 
-    /// Find overlap between end of s1 and start of s2
+    /// Find overlap between end of s1 and start of s2 (with fuzzy matching)
     fn find_overlap(&self, s1: &str, s2: &str) -> usize {
         let chars1: Vec<char> = s1.chars().collect();
         let chars2: Vec<char> = s2.chars().collect();
         let max_overlap = chars1.len().min(chars2.len());
 
+        // First try exact match
         for overlap_len in (1..=max_overlap).rev() {
             let suffix: String = chars1[chars1.len() - overlap_len..].iter().collect();
             let prefix: String = chars2[..overlap_len].iter().collect();
@@ -334,6 +335,49 @@ impl LineRecognizer {
                 return overlap_len;
             }
         }
+
+        // Try anchor-based matching: find a short distinctive substring
+        // This handles cases where OCR inserts extra chars like "标准" vs "e标准"
+        let anchor_len = 2; // Look for 2-char anchors (more flexible)
+        if chars1.len() >= anchor_len && chars2.len() >= anchor_len {
+            // Search backwards from end of s1 for anchors
+            let search_range = max_overlap.min(12); // Search in last 12 chars
+            // Include all possible anchor positions up to the end of s1
+            for i in 0..=search_range.saturating_sub(anchor_len) {
+                let anchor_start = chars1.len() - search_range + i;
+                let anchor: String = chars1[anchor_start..anchor_start + anchor_len].iter().collect();
+
+                // Skip common punctuation anchors
+                if anchor.chars().all(|c| c.is_ascii_punctuation() || c == ',' || c == '。') {
+                    continue;
+                }
+
+                // Look for this anchor at start of s2
+                let s2_search_range = (search_range + 5).min(chars2.len());
+                for j in 0..s2_search_range.saturating_sub(anchor_len) {
+                    let prefix: String = chars2[j..j + anchor_len].iter().collect();
+                    if anchor == prefix {
+                        // Found anchor, calculate overlap
+                        // s1 ends at anchor_start + anchor_len, s2 has anchor at position j
+                        // We want to skip j + (chars1.len() - anchor_start) chars from s2
+                        let overlap_in_s2 = j + (chars1.len() - anchor_start);
+                        if overlap_in_s2 <= chars2.len() && overlap_in_s2 >= 2 {
+                            return overlap_in_s2;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: estimate overlap based on typical 30% image overlap
+        // Skip ~25% of s2 characters if s2 is reasonably long
+        if chars2.len() >= 4 {
+            let estimated_overlap = chars2.len() * 25 / 100;
+            if estimated_overlap >= 2 {
+                return estimated_overlap;
+            }
+        }
+
         0
     }
 }
