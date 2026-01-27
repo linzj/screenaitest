@@ -20,8 +20,8 @@ walkdir = "2"
 log = "0.4"
 env_logger = "0.11"
 
-# TFLite C API bindings
-tflitec = "0.7"
+# TFLite C API bindings with XNNPACK acceleration
+tflitec = { version = "0.7", features = ["xnnpack"] }
 
 # Array operations
 ndarray = "0.16"

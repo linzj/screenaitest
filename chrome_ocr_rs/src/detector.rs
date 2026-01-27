@@ -36,7 +36,8 @@ impl TextDetector {
 
         // Create a temporary interpreter to get input sizes
         let input_sizes = {
-            let options = Options::default();
+            let mut options = Options::default();
+            options.is_xnnpack_enabled = true; // Enable XNNPACK
             let interpreter = Interpreter::new(&model, Some(options))?;
             interpreter.allocate_tensors()?;
 
@@ -100,9 +101,10 @@ impl TextDetector {
     pub fn detect(&mut self, image: &GrayImage, threshold: f32) -> Result<Vec<BBox>> {
         let preprocessed = self.preprocess(image);
 
-        // Create interpreter for this detection with multi-threading
+        // Create interpreter for this detection with multi-threading and XNNPACK
         let mut options = Options::default();
         options.thread_count = 4; // Use 4 threads
+        options.is_xnnpack_enabled = true; // Enable XNNPACK acceleration
         let interpreter = Interpreter::new(&self.model, Some(options))?;
         interpreter.allocate_tensors()?;
 

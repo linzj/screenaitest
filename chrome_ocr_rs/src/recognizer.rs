@@ -47,7 +47,8 @@ impl LineRecognizer {
 
         // Get output shape info and quantization params
         let (time_steps, vocab_size, output_idx, scale_val, zero_point) = {
-            let options = Options::default();
+            let mut options = Options::default();
+            options.is_xnnpack_enabled = true; // Enable XNNPACK
             let interpreter = Interpreter::new(&model, Some(options))?;
             interpreter.allocate_tensors()?;
 
@@ -83,6 +84,7 @@ impl LineRecognizer {
     pub fn create_interpreter(&self) -> Result<Interpreter> {
         let mut options = Options::default();
         options.thread_count = 4; // Use 4 threads
+        options.is_xnnpack_enabled = true; // Enable XNNPACK acceleration
         let interpreter = Interpreter::new(&self.model, Some(options))?;
         interpreter.allocate_tensors()?;
         Ok(interpreter)
