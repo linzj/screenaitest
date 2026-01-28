@@ -6,9 +6,10 @@ use std::time::Instant;
 use crate::detector::TextDetector;
 use crate::recognizer::LineRecognizer;
 use crate::sorter::LayoutSorter;
-use crate::utils::{calc_containment, calc_iou, calc_xy_overlap, BBox};
+use crate::utils::{calc_containment, calc_iou, BBox};
 
 const MIN_HEIGHT: u32 = 40;
+const TARGET_SIZE: u32 = 4096;
 
 #[derive(Default)]
 pub struct PerfStats {
@@ -124,15 +125,15 @@ impl ChromeOCR {
         println!("Image: {}x{}", width, height);
 
         // Step 1: Text Detection
+        println!(
+            "\n[1/3] Text Detection (on {}x{})...",
+            TARGET_SIZE, TARGET_SIZE
+        );
         let t0 = Instant::now();
         let boxes = self.detector.detect(&image, 0.5)?;
         self.stats.detection = t0.elapsed().as_secs_f64();
-        let target_size = self.detector.target_size;
-        println!(
-            "\n[1/3] Text Detection (on {}x{})...",
-            target_size, target_size
-        );
         println!("  Found {} char-level regions", boxes.len());
+        println!("  Scale factor: {:.2}x", self.detector.scale);
 
         // Merge boxes to lines
         let t1 = Instant::now();
@@ -143,7 +144,7 @@ impl ChromeOCR {
         // Step 2: Layout Sorting
         println!("\n[2/3] Layout Sorting...");
         let t2 = Instant::now();
-        let sorted_lines = self.sorter.sort(&merged, (target_size, target_size))?;
+        let sorted_lines = self.sorter.sort(&merged, (TARGET_SIZE, TARGET_SIZE))?;
         self.stats.sorting = t2.elapsed().as_secs_f64();
 
         // Step 3: Line Recognition
@@ -178,8 +179,7 @@ impl ChromeOCR {
         let rec_interpreter = self.recognizer.create_interpreter()?;
 
         for bbox in &sorted_lines {
-            // Convert padded coordinates to original image coordinates
-            // Subtract offset, then divide by scale
+            // Convert 4096 coordinates to original image coordinates
             let mut x1 = ((bbox.x1 - offset_x) / scale) as i32;
             let mut y1 = ((bbox.y1 - offset_y) / scale) as i32;
             let mut x2 = ((bbox.x2 - offset_x) / scale) as i32;
@@ -240,7 +240,8 @@ impl ChromeOCR {
                     sub_region
                 };
 
-                // Check for duplicates
+                // Check for duplicates using Chrome's RemoveOverlaps parameters from IDA:
+                // line_overlap_iou_threshold = 0.6, minimum_breadth_ratio = 0.6
                 let is_duplicate =
                     recognized_lines
                         .iter()
@@ -258,15 +259,44 @@ impl ChromeOCR {
                                 (prev_y as u32 + prev_h) as f32,
                             ];
 
-                            let y_overlap = (b1[3].min(b2[3]) - b1[1].max(b2[1])).max(0.0);
-                            let x_overlap = (b1[2].min(b2[2]) - b1[0].max(b2[0])).max(0.0);
-                            let min_h = (b1[3] - b1[1]).min(b2[3] - b2[1]);
-                            let min_w = (b1[2] - b1[0]).min(b2[2] - b2[0]);
+                            // Calculate IoU (Chrome: line_overlap_iou_threshold = 0.6)
+                            let iou = calc_iou(&b1, &b2);
+                            if iou > 0.6 {
+                                return true;
+                            }
 
-                            min_h > 0.0
-                                && min_w > 0.0
-                                && y_overlap / min_h > 0.5
-                                && x_overlap / min_w > 0.5
+                            // Calculate containment
+                            let containment1 = calc_containment(&b1, &b2);
+                            let containment2 = calc_containment(&b2, &b1);
+                            if containment1 > 0.6 || containment2 > 0.6 {
+                                return true;
+                            }
+
+                            // Check breadth ratio (Chrome: minimum_breadth_ratio = 0.6)
+                            let w1 = b1[2] - b1[0];
+                            let w2 = b2[2] - b2[0];
+                            let breadth_ratio = w1.min(w2) / w1.max(w2);
+
+                            // Only compare if similar width (same line type)
+                            if breadth_ratio < 0.6 {
+                                return false;
+                            }
+
+                            // Check vertical overlap
+                            let y_overlap = (b1[3].min(b2[3]) - b1[1].max(b2[1])).max(0.0);
+                            let min_h = (b1[3] - b1[1]).min(b2[3] - b2[1]);
+                            let y_overlap_ratio = if min_h > 0.0 { y_overlap / min_h } else { 0.0 };
+
+                            // Chrome: minimum_breadth_overlap = 0.6 for horizontal overlap
+                            let x_overlap = (b1[2].min(b2[2]) - b1[0].max(b2[0])).max(0.0);
+                            let x_overlap_ratio = if w1.min(w2) > 0.0 {
+                                x_overlap / w1.min(w2)
+                            } else {
+                                0.0
+                            };
+
+                            // Same row with significant x overlap
+                            y_overlap_ratio > 0.6 && x_overlap_ratio > 0.5
                         });
 
                 if is_duplicate {
@@ -278,6 +308,9 @@ impl ChromeOCR {
                 let (text, conf) = self
                     .recognizer
                     .recognize_with_interpreter(&sub_region, &rec_interpreter)?;
+
+                // Post-process to clean up artifacts
+                let text = Self::post_process_text(&text);
 
                 // Filter out very short fragments (likely noise)
                 let text_len = text.chars().count();
@@ -359,8 +392,10 @@ impl ChromeOCR {
 
                         let x_dist = (other.1 - g.1).abs();
                         let y_dist = (other.2 - g.2).abs();
-                        let x_thresh = other.3 + g.3; // Same as Python
-                        let y_thresh = (other.4 + g.4) * 0.3; // Same as Python
+                        let x_thresh = other.3 + g.3; // x distance < sum of widths
+                                                      // Chrome uses maximum_depth_gap=1.5 relative to avg height
+                                                      // Use 0.5 * combined heights for more aggressive merging
+                        let y_thresh = (other.4 + g.4) * 0.5;
 
                         if x_dist < x_thresh && y_dist < y_thresh {
                             group.push(j);
@@ -399,42 +434,78 @@ impl ChromeOCR {
             }
         }
 
-        // Apply NMS to remove overlapping boxes (like Python: iou_threshold=0.5)
+        // Apply NMS to remove overlapping boxes (iou_threshold=0.5)
         self.nms_merged_boxes(merged, 0.5)
     }
 
-    /// Apply NMS to merged boxes
+    /// Apply NMS to merged boxes - using Chrome's RemoveOverlaps parameters from IDA analysis
+    /// Key thresholds: line_overlap_iou_threshold=0.6, minimum_breadth_ratio=0.6
     fn nms_merged_boxes(&self, mut boxes: Vec<BBox>, iou_threshold: f32) -> Vec<BBox> {
         if boxes.len() <= 1 {
             return boxes;
         }
 
-        // Sort by confidence (higher first), then by area (larger first)
+        // Sort by area (larger first) - larger boxes are more likely to be complete lines
         boxes.sort_by(|a, b| {
-            b.conf
-                .partial_cmp(&a.conf)
+            let area_a = a.width() * a.height();
+            let area_b = b.width() * b.height();
+            area_b
+                .partial_cmp(&area_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    let area_a = a.width() * a.height();
-                    let area_b = b.width() * b.height();
-                    area_b
-                        .partial_cmp(&area_a)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
         });
 
         let mut kept = Vec::new();
 
         for bbox in boxes {
             let b = bbox.as_array();
+            let b_w = b[2] - b[0];
+            let b_h = b[3] - b[1];
+
+            // Check if this box significantly overlaps with any kept box
             let is_dominated = kept.iter().any(|k: &BBox| {
                 let kb = k.as_array();
+                let kb_w = kb[2] - kb[0];
+                let kb_h = kb[3] - kb[1];
+
+                // Chrome's MergeLines: minimum_breadth_ratio = 0.6
+                let breadth_ratio = b_w.min(kb_w) / b_w.max(kb_w);
+                if breadth_ratio < 0.6 {
+                    return false; // Widths too different, not same line
+                }
+
+                // Calculate vertical overlap (depth overlap)
+                let y_overlap = (b[3].min(kb[3]) - b[1].max(kb[1])).max(0.0);
+                let min_h = b_h.min(kb_h);
+                let y_overlap_ratio = if min_h > 0.0 { y_overlap / min_h } else { 0.0 };
+
+                // Chrome's MergeLines: minimum_breadth_overlap = 0.6
+                let x_overlap = (b[2].min(kb[2]) - b[0].max(kb[0])).max(0.0);
+                let merged_w = b[2].max(kb[2]) - b[0].min(kb[0]);
+                let breadth_overlap = if merged_w > 0.0 {
+                    (b_w + kb_w - merged_w) / merged_w
+                } else {
+                    0.0
+                };
+
+                // Chrome's MergeLines: maximum_depth_gap = 1.5 (relative to avg height)
+                let avg_h = (b_h + kb_h) * 0.5;
+                let merged_h = b[3].max(kb[3]) - b[1].min(kb[1]);
+                let depth_gap = (merged_h - b_h - kb_h).max(0.0);
+                let depth_gap_ratio = if avg_h > 0.0 { depth_gap / avg_h } else { 0.0 };
+
+                // IOU and containment checks (Chrome: line_overlap_iou_threshold = 0.6)
                 let iou = calc_iou(&b, &kb);
                 let containment1 = calc_containment(&b, &kb);
                 let containment2 = calc_containment(&kb, &b);
-                let xy_overlap = calc_xy_overlap(&b, &kb);
 
-                iou > iou_threshold || containment1 > 0.6 || containment2 > 0.6 || xy_overlap > 0.5
+                // Merge if:
+                // 1. High IOU (>0.6) or
+                // 2. One contains the other (>0.6) or
+                // 3. Same row (y_overlap > 0.6) AND significant x overlap AND small depth gap
+                let same_row =
+                    y_overlap_ratio > 0.6 && breadth_overlap > 0.3 && depth_gap_ratio < 1.5;
+
+                iou > iou_threshold || containment1 > 0.6 || containment2 > 0.6 || same_row
             });
 
             if !is_dominated {
@@ -445,12 +516,57 @@ impl ChromeOCR {
         kept
     }
 
+    /// Post-process recognized text to clean up artifacts
+    /// Based on Chrome's FilterJunkMutator from IDA analysis
+    fn post_process_text(text: &str) -> String {
+        let mut result = String::new();
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let c = chars[i];
+
+            // Skip isolated punctuation artifacts between CJK characters
+            // Based on Chrome's RemoveJunkWords
+            if i > 0 && i + 1 < chars.len() {
+                let prev = chars[i - 1];
+                let next = chars[i + 1];
+
+                let prev_is_cjk = prev >= '\u{4E00}' && prev <= '\u{9FFF}';
+                let next_is_cjk = next >= '\u{4E00}' && next <= '\u{9FFF}';
+
+                // Artifact characters that commonly appear between CJK
+                let c_is_artifact = c == '|' || c == '!' || c == '$';
+
+                if prev_is_cjk && next_is_cjk && c_is_artifact {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Clean up doubled punctuation like ",," or ".."
+            if i + 1 < chars.len()
+                && c == chars[i + 1]
+                && (c == ',' || c == '.' || c == '。' || c == '，')
+            {
+                result.push(c);
+                i += 2;
+                continue;
+            }
+
+            result.push(c);
+            i += 1;
+        }
+
+        result
+    }
+
     /// Split multi-line region using horizontal projection
     fn split_multiline_region(&self, region: &GrayImage) -> Vec<(GrayImage, u32)> {
         let (w, h) = (region.width(), region.height());
 
-        // Don't split short regions (50px can contain ~2 lines of 25px each)
-        if h < 50 {
+        // Don't split short regions
+        if h < 60 {
             return vec![(region.clone(), 0)];
         }
 
