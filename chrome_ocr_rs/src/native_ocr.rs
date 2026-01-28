@@ -159,13 +159,9 @@ pub struct NativeOCR {
 
 impl NativeOCR {
     pub fn new(model_dir: &Path) -> Result<Self> {
-        let chrome_dll_path = model_dir.join("chrome_screen_ai.dll");
-        if !chrome_dll_path.exists() {
-            return Err(anyhow!(
-                "chrome_screen_ai.dll not found at {}",
-                chrome_dll_path.display()
-            ));
-        }
+        // Look for chrome_screen_ai.dll in multiple locations
+        let chrome_dll_path = Self::find_dll(model_dir)?;
+
 
         // Set global model dir for callbacks
         unsafe {
@@ -214,6 +210,36 @@ impl NativeOCR {
                 max_dimension,
             })
         }
+    }
+
+    /// Find chrome_screen_ai.dll in multiple locations
+    fn find_dll(model_dir: &Path) -> Result<std::path::PathBuf> {
+        // 1. Check in model directory (Chrome's layout)
+        let dll_in_model = model_dir.join("chrome_screen_ai.dll");
+        if dll_in_model.exists() {
+            return Ok(dll_in_model);
+        }
+
+        // 2. Check relative to executable
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let dll_near_exe = exe_dir.join("chrome_screen_ai.dll");
+                if dll_near_exe.exists() {
+                    return Ok(dll_near_exe);
+                }
+            }
+        }
+
+        // 3. Check in current working directory
+        let dll_in_cwd = std::path::PathBuf::from("chrome_screen_ai.dll");
+        if dll_in_cwd.exists() {
+            return Ok(dll_in_cwd);
+        }
+
+        Err(anyhow!(
+            "chrome_screen_ai.dll not found. Checked:\n  - {}\n  - near executable\n  - current directory",
+            dll_in_model.display()
+        ))
     }
 
     /// Perform OCR on a grayscale image, returns raw protobuf bytes

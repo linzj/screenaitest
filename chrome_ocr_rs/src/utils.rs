@@ -2,9 +2,26 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
 /// Find Chrome Screen AI model directory
+/// First tries Chrome's local directory, then falls back to bundled models
 pub fn find_model_dir() -> Result<PathBuf> {
-    let local_app_data =
-        dirs::data_local_dir().ok_or_else(|| anyhow!("Cannot find local app data directory"))?;
+    // Try Chrome's local model directory first
+    if let Some(chrome_dir) = find_chrome_model_dir() {
+        return Ok(chrome_dir);
+    }
+
+    // Fallback to bundled models directory
+    if let Some(bundled_dir) = find_bundled_model_dir() {
+        return Ok(bundled_dir);
+    }
+
+    Err(anyhow!(
+        "Model directory not found. Please install Chrome or place models in the 'models' directory."
+    ))
+}
+
+/// Find Chrome's local Screen AI model directory
+fn find_chrome_model_dir() -> Option<PathBuf> {
+    let local_app_data = dirs::data_local_dir()?;
 
     let screen_ai_dir = local_app_data
         .join("Google")
@@ -13,14 +30,12 @@ pub fn find_model_dir() -> Result<PathBuf> {
         .join("screen_ai");
 
     if !screen_ai_dir.exists() {
-        return Err(anyhow!(
-            "Chrome Screen AI directory not found: {}",
-            screen_ai_dir.display()
-        ));
+        return None;
     }
 
     // Find the latest version directory
-    let mut versions: Vec<_> = std::fs::read_dir(&screen_ai_dir)?
+    let mut versions: Vec<_> = std::fs::read_dir(&screen_ai_dir)
+        .ok()?
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path().is_dir()
@@ -44,10 +59,30 @@ pub fn find_model_dir() -> Result<PathBuf> {
         vb.cmp(&va)
     });
 
-    versions
-        .first()
-        .map(|e| e.path())
-        .ok_or_else(|| anyhow!("No version directory found in {}", screen_ai_dir.display()))
+    versions.first().map(|e| e.path())
+}
+
+/// Find bundled models directory relative to executable
+fn find_bundled_model_dir() -> Option<PathBuf> {
+    // Try relative to executable
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let models_dir = exe_dir.join("models");
+            if models_dir.exists() && models_dir.join("gocr").exists() {
+                return Some(models_dir);
+            }
+        }
+    }
+
+    // Try current working directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let models_dir = cwd.join("models");
+        if models_dir.exists() && models_dir.join("gocr").exists() {
+            return Some(models_dir);
+        }
+    }
+
+    None
 }
 
 /// Load vocabulary from JSON char map file
