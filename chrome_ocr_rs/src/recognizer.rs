@@ -6,7 +6,7 @@ use tflitec::model::Model;
 
 const MODEL_HEIGHT: u32 = 32;
 const MODEL_WIDTH: u32 = 168;
-const LEFT_MARGIN: u32 = 12;  // Left margin for TFLite model (different from ONNX)
+const LEFT_MARGIN: u32 = 12; // Left margin for TFLite model (different from ONNX)
 const EFFECTIVE_WIDTH: u32 = MODEL_WIDTH - LEFT_MARGIN; // 156
 const CHAR_CONF_THRESHOLD: f32 = 0.15; // Filter low-confidence characters
 const BLANK_IDX: usize = 8178; // Blank token index
@@ -16,18 +16,18 @@ const FRAME_WIDTH: u32 = 4; // 168 pixels / 42 time steps = 4 pixels per frame
 /// From IDA: Chrome uses x0, x1 coordinates to detect duplicates
 #[derive(Clone, Debug)]
 struct CharWithPosition {
-    char: String,      // The recognized character
-    conf: f32,         // Confidence score
-    x0: u32,           // Start x position in original image
-    x1: u32,           // End x position in original image
-    time_step: usize,  // Time step in CTC output (for debugging)
+    char: String,     // The recognized character
+    conf: f32,        // Confidence score
+    x0: u32,          // Start x position in original image
+    x1: u32,          // End x position in original image
+    time_step: usize, // Time step in CTC output (for debugging)
 }
 
 /// Chunk information for tensor-level merging
 struct ChunkInfo {
     logits: Vec<f32>,
-    x_start: u32,  // Start pixel in original image
-    x_end: u32,    // End pixel in original image
+    x_start: u32, // Start pixel in original image
+    x_end: u32,   // End pixel in original image
 }
 
 pub struct LineRecognizer {
@@ -149,7 +149,7 @@ impl LineRecognizer {
             let chunk_w = (EFFECTIVE_WIDTH as f32 * h as f32 / MODEL_HEIGHT as f32) as u32;
 
             // Chrome uses 30% border on each side, so step = 40% of chunk_width
-            let step = (chunk_w as f32 * 0.4).max(1.0) as u32;  // 40% step = 60% overlap
+            let step = (chunk_w as f32 * 0.4).max(1.0) as u32; // 40% step = 60% overlap
 
             // Collect chunks with their pixel boundaries
             let mut chunks: Vec<ChunkInfo> = Vec::new();
@@ -321,7 +321,7 @@ impl LineRecognizer {
         // - Middle chunks: contribute frames 30% to 70% = 12.6 to 29.4 ≈ 17 frames
         // - Last chunk: contributes frames 30% to 100% = 12.6 to 42 ≈ 29 frames
 
-        let first_contribution = (self.time_steps as f32 * 0.7).floor() as usize;  // 29 frames
+        let first_contribution = (self.time_steps as f32 * 0.7).floor() as usize; // 29 frames
         let middle_contribution = (self.time_steps as f32 * 0.4).floor() as usize; // 16 frames
         let last_contribution = self.time_steps - (self.time_steps as f32 * 0.3).ceil() as usize; // 29 frames
 
@@ -331,17 +331,18 @@ impl LineRecognizer {
         chunk_lengths.push(first_contribution);
 
         // Middle chunks (if any)
-        for _ in 1..n-1 {
+        for _ in 1..n - 1 {
             chunk_lengths.push(middle_contribution);
         }
 
         // Last chunk - adjust to ensure perfect tiling
         // Calculate expected total frames from the image width
         let total_image_w = chunks.last().unwrap().x_end;
-        let expected_total = (total_image_w as f32 * MODEL_HEIGHT as f32 /
-                             (chunks[0].x_end - chunks[0].x_start) as f32 *
-                             self.time_steps as f32 /
-                             (MODEL_HEIGHT as f32)).round() as usize;
+        let expected_total = (total_image_w as f32 * MODEL_HEIGHT as f32
+            / (chunks[0].x_end - chunks[0].x_start) as f32
+            * self.time_steps as f32
+            / (MODEL_HEIGHT as f32))
+            .round() as usize;
 
         // For simplicity, use the calculated last contribution
         // The key is that we use floor/ceil consistently to avoid gaps
@@ -480,13 +481,22 @@ impl LineRecognizer {
     }
 
     /// Recognize a single segment using provided interpreter
-    fn recognize_segment_with_interpreter(&self, image: &GrayImage, interpreter: &Interpreter) -> Result<(String, f32)> {
+    fn recognize_segment_with_interpreter(
+        &self,
+        image: &GrayImage,
+        interpreter: &Interpreter,
+    ) -> Result<(String, f32)> {
         self.recognize_segment_trimmed(image, interpreter, 0, self.time_steps)
     }
 
     /// Recognize a segment with time step trimming (Chrome's TrimOutputScores behavior)
-    fn recognize_segment_trimmed(&self, image: &GrayImage, interpreter: &Interpreter,
-                                  start_t: usize, end_t: usize) -> Result<(String, f32)> {
+    fn recognize_segment_trimmed(
+        &self,
+        image: &GrayImage,
+        interpreter: &Interpreter,
+        start_t: usize,
+        end_t: usize,
+    ) -> Result<(String, f32)> {
         let (w, h) = (image.width(), image.height());
 
         // Scale to height 32
@@ -511,8 +521,12 @@ impl LineRecognizer {
     /// Recognize a segment and return characters with position information
     /// This is Chrome's exact method: each character has x0, x1 position for deduplication
     /// From IDA: frame_width = 4 pixels per time step
-    fn recognize_segment_with_positions(&self, image: &GrayImage, interpreter: &Interpreter,
-                                         chunk_x_offset: u32) -> Result<Vec<CharWithPosition>> {
+    fn recognize_segment_with_positions(
+        &self,
+        image: &GrayImage,
+        interpreter: &Interpreter,
+        chunk_x_offset: u32,
+    ) -> Result<Vec<CharWithPosition>> {
         let (w, h) = (image.width(), image.height());
 
         // Scale to height 32
@@ -561,8 +575,8 @@ impl LineRecognizer {
         let mut prev_idx: Option<usize> = None;
 
         // Calculate pixels per original image pixel in the scaled content
-        let content_pixels = new_w as f32;  // Content width in scaled image
-        let orig_w = w as f32;              // Original image width
+        let content_pixels = new_w as f32; // Content width in scaled image
+        let orig_w = w as f32; // Original image width
 
         for t in 0..self.time_steps {
             let base = t * self.vocab_size;
@@ -598,12 +612,18 @@ impl LineRecognizer {
                         let canvas_x1 = (t + 1) as f32 * FRAME_WIDTH as f32;
 
                         // Convert to content-relative (subtract LEFT_MARGIN, clamp to content bounds)
-                        let content_x0 = (canvas_x0 - LEFT_MARGIN as f32).max(0.0).min(content_pixels);
-                        let content_x1 = (canvas_x1 - LEFT_MARGIN as f32).max(0.0).min(content_pixels);
+                        let content_x0 = (canvas_x0 - LEFT_MARGIN as f32)
+                            .max(0.0)
+                            .min(content_pixels);
+                        let content_x1 = (canvas_x1 - LEFT_MARGIN as f32)
+                            .max(0.0)
+                            .min(content_pixels);
 
                         // Convert from scaled content to original image coordinates
-                        let orig_x0 = (content_x0 / content_pixels * orig_w) as u32 + chunk_x_offset;
-                        let orig_x1 = (content_x1 / content_pixels * orig_w) as u32 + chunk_x_offset;
+                        let orig_x0 =
+                            (content_x0 / content_pixels * orig_w) as u32 + chunk_x_offset;
+                        let orig_x1 =
+                            (content_x1 / content_pixels * orig_w) as u32 + chunk_x_offset;
 
                         result.push(CharWithPosition {
                             char: c.clone(),
@@ -630,7 +650,13 @@ impl LineRecognizer {
         }
 
         // Sort by x0 position (left edge)
-        chars.sort_by(|a, b| a.x0.cmp(&b.x0).then_with(|| b.conf.partial_cmp(&a.conf).unwrap_or(std::cmp::Ordering::Equal)));
+        chars.sort_by(|a, b| {
+            a.x0.cmp(&b.x0).then_with(|| {
+                b.conf
+                    .partial_cmp(&a.conf)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
 
         let mut result: Vec<CharWithPosition> = Vec::new();
 
@@ -712,7 +738,9 @@ impl LineRecognizer {
 
             // Check overlap lengths from expected_overlap-range to expected_overlap+range
             let min_check = 1.max(expected_overlap.saturating_sub(search_range));
-            let max_check = (expected_overlap + search_range).min(result_chars.len()).min(next_chars.len());
+            let max_check = (expected_overlap + search_range)
+                .min(result_chars.len())
+                .min(next_chars.len());
 
             for overlap_len in min_check..=max_check {
                 if overlap_len > result_chars.len() || overlap_len > next_chars.len() {
@@ -730,7 +758,8 @@ impl LineRecognizer {
 
                 // Score: matches weighted by overlap length (prefer longer overlaps with good match rate)
                 let match_rate = matches as f32 / overlap_len as f32;
-                if match_rate >= 0.6 { // At least 60% match
+                if match_rate >= 0.6 {
+                    // At least 60% match
                     let score = (matches * overlap_len) as i32;
                     if score > best_score {
                         best_score = score;
@@ -790,8 +819,14 @@ impl LineRecognizer {
             // Check for pattern "XYX" where Y is noise (e.g., "防:防" -> "防")
             if i + 2 < chars.len() && chars[i] == chars[i + 2] {
                 let middle = chars[i + 1];
-                if middle.is_ascii_punctuation() || middle == ':' || middle == ',' ||
-                   middle == '.' || middle == '。' || middle == '、' || middle == '♦' {
+                if middle.is_ascii_punctuation()
+                    || middle == ':'
+                    || middle == ','
+                    || middle == '.'
+                    || middle == '。'
+                    || middle == '、'
+                    || middle == '♦'
+                {
                     result.push(chars[i]);
                     i += 3;
                     continue;
@@ -852,7 +887,13 @@ impl LineRecognizer {
         // Characters that are rare and often appear as OCR errors
         matches!(c, '芮' | 'í' | 'ì' | '兹' | '戎' | '讨' | '˙' | 'D' | ':' | '1'
             if c.is_ascii_digit() || c.is_ascii_punctuation())
-            || c == '芮' || c == 'í' || c == 'ì' || c == '兹' || c == '戎' || c == '讨' || c == '˙'
+            || c == '芮'
+            || c == 'í'
+            || c == 'ì'
+            || c == '兹'
+            || c == '戎'
+            || c == '讨'
+            || c == '˙'
     }
 
     /// Merge text segments by finding overlapping suffix/prefix
@@ -1124,7 +1165,8 @@ impl LineRecognizer {
                 // and both X are the same, skip the noise and second X
                 if c == next2 && !c.is_ascii_punctuation() && !c.is_whitespace() {
                     // Check if middle char is punctuation or unusual
-                    if next1.is_ascii_punctuation() || next1 == '|' || next1 == '!' || next1 == ':' {
+                    if next1.is_ascii_punctuation() || next1 == '|' || next1 == '!' || next1 == ':'
+                    {
                         i += 3; // Skip "X?X", we already added first X
                         continue;
                     }
@@ -1180,7 +1222,9 @@ impl LineRecognizer {
         if num_len >= 6 {
             // Try to find a 4-digit year pattern
             for year_start in 0..=(num_len - 4) {
-                let potential_year: String = chars[start + year_start..start + year_start + 4].iter().collect();
+                let potential_year: String = chars[start + year_start..start + year_start + 4]
+                    .iter()
+                    .collect();
                 if let Ok(year) = potential_year.parse::<u32>() {
                     if (1900..=2100).contains(&year) {
                         // Check if there's overlap before or after
@@ -1227,7 +1271,8 @@ impl LineRecognizer {
         let c = chars[i];
 
         // Common single-char artifacts that appear at segment boundaries
-        let is_single_artifact = matches!(c, 'e' | 'i' | 'l' | 'I' | 'o' | 'O' | '(' | ')' | '[' | ']');
+        let is_single_artifact =
+            matches!(c, 'e' | 'i' | 'l' | 'I' | 'o' | 'O' | '(' | ')' | '[' | ']');
 
         if !is_single_artifact {
             return false;
@@ -1298,7 +1343,11 @@ impl LineRecognizer {
             let prefix = &chars2[..overlap_len];
 
             // Count matching characters
-            let matches = suffix.iter().zip(prefix.iter()).filter(|(a, b)| a == b).count();
+            let matches = suffix
+                .iter()
+                .zip(prefix.iter())
+                .filter(|(a, b)| a == b)
+                .count();
             // Allow up to 1 mismatch for overlaps of 3+ chars
             if matches >= overlap_len - 1 {
                 return overlap_len;
