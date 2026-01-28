@@ -107,15 +107,21 @@ impl TextDetector {
 
         // Resize if needed and paste
         if self.scale != 1.0 {
-            let resized = image::imageops::resize(
-                image,
-                new_w,
-                new_h,
-                image::imageops::FilterType::Lanczos3,
+            let resized =
+                image::imageops::resize(image, new_w, new_h, image::imageops::FilterType::Lanczos3);
+            image::imageops::overlay(
+                &mut canvas,
+                &resized,
+                self.offset_x as i64,
+                self.offset_y as i64,
             );
-            image::imageops::overlay(&mut canvas, &resized, self.offset_x as i64, self.offset_y as i64);
         } else {
-            image::imageops::overlay(&mut canvas, image, self.offset_x as i64, self.offset_y as i64);
+            image::imageops::overlay(
+                &mut canvas,
+                image,
+                self.offset_x as i64,
+                self.offset_y as i64,
+            );
         }
 
         canvas

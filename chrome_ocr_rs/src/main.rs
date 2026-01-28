@@ -92,13 +92,19 @@ fn run_ab_test(args: &Args, model_dir: &PathBuf) -> Result<()> {
     println!("AB Test Results");
     println!("==================================================");
 
-    println!("\n[TFLite] Time: {:.1} ms", tflite_time.as_secs_f64() * 1000.0);
+    println!(
+        "\n[TFLite] Time: {:.1} ms",
+        tflite_time.as_secs_f64() * 1000.0
+    );
     match &tflite_result {
         Ok(lines) => println!("  Lines: {}", lines.len()),
         Err(e) => println!("  Error: {}", e),
     }
 
-    println!("\n[Native] Time: {:.1} ms", native_time.as_secs_f64() * 1000.0);
+    println!(
+        "\n[Native] Time: {:.1} ms",
+        native_time.as_secs_f64() * 1000.0
+    );
     match &native_result {
         Ok(lines) => println!("  Lines: {}", lines.len()),
         Err(e) => println!("  Error: {}", e),
@@ -147,7 +153,10 @@ fn run_native_ocr(args: &Args, model_dir: &PathBuf) -> Result<()> {
         println!("==================================================");
         println!("  Loading:   {:7.1} ms", load_time.as_secs_f64() * 1000.0);
         println!("  OCR:       {:7.1} ms", ocr_time.as_secs_f64() * 1000.0);
-        println!("  Total:     {:7.1} ms", (load_time + ocr_time).as_secs_f64() * 1000.0);
+        println!(
+            "  Total:     {:7.1} ms",
+            (load_time + ocr_time).as_secs_f64() * 1000.0
+        );
     }
 
     Ok(())
@@ -178,7 +187,10 @@ fn run_tflite_ocr(args: &Args, model_dir: &PathBuf) -> Result<()> {
         println!("==================================================");
         println!("Model Loading:");
         ocr.print_load_stats();
-        println!("  Total:          {:7.1} ms", load_time.as_secs_f64() * 1000.0);
+        println!(
+            "  Total:          {:7.1} ms",
+            load_time.as_secs_f64() * 1000.0
+        );
         println!("\nOCR Processing:");
         ocr.print_ocr_stats();
         let total = load_time.as_secs_f64() + ocr.get_ocr_total();

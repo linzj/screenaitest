@@ -77,7 +77,15 @@ impl LineRecognizer {
             (ts, vs, out_idx, sv, zp)
         };
 
-        Ok(Self { model, vocab, time_steps, vocab_size, output_idx, scale_val, zero_point })
+        Ok(Self {
+            model,
+            vocab,
+            time_steps,
+            vocab_size,
+            output_idx,
+            scale_val,
+            zero_point,
+        })
     }
 
     /// Create a new interpreter for batch processing
@@ -91,7 +99,11 @@ impl LineRecognizer {
     }
 
     /// Recognize text from a line image using provided interpreter
-    pub fn recognize_with_interpreter(&self, image: &GrayImage, interpreter: &Interpreter) -> Result<(String, f32)> {
+    pub fn recognize_with_interpreter(
+        &self,
+        image: &GrayImage,
+        interpreter: &Interpreter,
+    ) -> Result<(String, f32)> {
         let (w, h) = (image.width(), image.height());
 
         if w < 5 || h < 5 {
@@ -191,7 +203,11 @@ impl LineRecognizer {
     }
 
     /// Recognize a single segment using provided interpreter
-    fn recognize_segment_with_interpreter(&self, image: &GrayImage, interpreter: &Interpreter) -> Result<(String, f32)> {
+    fn recognize_segment_with_interpreter(
+        &self,
+        image: &GrayImage,
+        interpreter: &Interpreter,
+    ) -> Result<(String, f32)> {
         let (w, h) = (image.width(), image.height());
 
         // Scale to height 32
@@ -220,7 +236,11 @@ impl LineRecognizer {
     }
 
     /// Recognize a 168x32 canvas using provided interpreter
-    fn recognize_canvas_with_interpreter(&self, canvas: &GrayImage, interpreter: &Interpreter) -> Result<(String, f32)> {
+    fn recognize_canvas_with_interpreter(
+        &self,
+        canvas: &GrayImage,
+        interpreter: &Interpreter,
+    ) -> Result<(String, f32)> {
         // Prepare input data [1, 32, 168, 1]
         let input_data: Vec<u8> = canvas.as_raw().to_vec();
 
@@ -342,13 +362,18 @@ impl LineRecognizer {
         if chars1.len() >= anchor_len && chars2.len() >= anchor_len {
             // Search backwards from end of s1 for anchors
             let search_range = max_overlap.min(12); // Search in last 12 chars
-            // Include all possible anchor positions up to the end of s1
+                                                    // Include all possible anchor positions up to the end of s1
             for i in 0..=search_range.saturating_sub(anchor_len) {
                 let anchor_start = chars1.len() - search_range + i;
-                let anchor: String = chars1[anchor_start..anchor_start + anchor_len].iter().collect();
+                let anchor: String = chars1[anchor_start..anchor_start + anchor_len]
+                    .iter()
+                    .collect();
 
                 // Skip common punctuation anchors
-                if anchor.chars().all(|c| c.is_ascii_punctuation() || c == ',' || c == '。') {
+                if anchor
+                    .chars()
+                    .all(|c| c.is_ascii_punctuation() || c == ',' || c == '。')
+                {
                     continue;
                 }
 

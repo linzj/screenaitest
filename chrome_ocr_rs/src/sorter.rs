@@ -30,9 +30,8 @@ impl LayoutSorter {
             .collect();
 
         // Sort by y (row) first
-        boxes_with_center.sort_by(|a, b| {
-            a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        boxes_with_center
+            .sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
         // Group into rows
         let row_threshold = 0.03f32;
@@ -44,17 +43,14 @@ impl LayoutSorter {
                 current_row.push(item);
             } else {
                 // Sort current row by x and add to rows
-                current_row.sort_by(|a, b| {
-                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                current_row
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 rows.push(current_row);
                 current_row = vec![item];
             }
         }
         // Don't forget the last row
-        current_row.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        current_row.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         rows.push(current_row);
 
         // Flatten rows into result

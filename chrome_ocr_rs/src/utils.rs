@@ -106,11 +106,11 @@ pub fn load_vocab(path: &std::path::Path) -> Result<Vec<String>> {
     if json_path.exists() {
         let content = std::fs::read_to_string(&json_path)?;
         let map: std::collections::HashMap<String, String> =
-            serde_json::from_str(&content)
-            .map_err(|e| anyhow!("Failed to parse JSON: {}", e))?;
+            serde_json::from_str(&content).map_err(|e| anyhow!("Failed to parse JSON: {}", e))?;
 
         // Find max index
-        let max_idx = map.keys()
+        let max_idx = map
+            .keys()
             .filter_map(|k| k.parse::<usize>().ok())
             .max()
             .unwrap_or(0);

@@ -68,9 +68,18 @@ impl ChromeOCR {
     }
 
     pub fn print_load_stats(&self) {
-        println!("  TextDetector:   {:7.1} ms", self.stats.load_detector * 1000.0);
-        println!("  LayoutSorter:   {:7.1} ms", self.stats.load_sorter * 1000.0);
-        println!("  LineRecognizer: {:7.1} ms", self.stats.load_recognizer * 1000.0);
+        println!(
+            "  TextDetector:   {:7.1} ms",
+            self.stats.load_detector * 1000.0
+        );
+        println!(
+            "  LayoutSorter:   {:7.1} ms",
+            self.stats.load_sorter * 1000.0
+        );
+        println!(
+            "  LineRecognizer: {:7.1} ms",
+            self.stats.load_recognizer * 1000.0
+        );
     }
 
     pub fn print_ocr_stats(&self) {
@@ -266,7 +275,9 @@ impl ChromeOCR {
 
                 // Recognize using shared interpreter
                 rec_count += 1;
-                let (text, conf) = self.recognizer.recognize_with_interpreter(&sub_region, &rec_interpreter)?;
+                let (text, conf) = self
+                    .recognizer
+                    .recognize_with_interpreter(&sub_region, &rec_interpreter)?;
 
                 // Filter out very short fragments (likely noise)
                 let text_len = text.chars().count();

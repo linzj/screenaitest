@@ -42,11 +42,11 @@ const SK_ALPHA_TYPE_UNPREMUL: i32 = 3;
 #[repr(C)]
 #[derive(Debug, Clone)]
 struct SkImageInfo {
-    color_space: *const std::ffi::c_void,  // +0x00: sk_sp<SkColorSpace> (8 bytes)
-    color_type: i32,                        // +0x08: SkColorType (4 bytes)
-    alpha_type: i32,                        // +0x0C: SkAlphaType (4 bytes)
-    width: i32,                             // +0x10: width (4 bytes)
-    height: i32,                            // +0x14: height (4 bytes)
+    color_space: *const std::ffi::c_void, // +0x00: sk_sp<SkColorSpace> (8 bytes)
+    color_type: i32,                      // +0x08: SkColorType (4 bytes)
+    alpha_type: i32,                      // +0x0C: SkAlphaType (4 bytes)
+    width: i32,                           // +0x10: width (4 bytes)
+    height: i32,                          // +0x14: height (4 bytes)
 }
 
 /// SkPixmap - lightweight pixel access (40 bytes)
@@ -54,19 +54,19 @@ struct SkImageInfo {
 #[repr(C)]
 #[derive(Debug, Clone)]
 struct SkPixmap {
-    pixels: *const u8,      // +0x00: pixel data pointer (8 bytes)
-    row_bytes: usize,       // +0x08: bytes per row (8 bytes)
-    info: SkImageInfo,      // +0x10: image info (24 bytes)
+    pixels: *const u8, // +0x00: pixel data pointer (8 bytes)
+    row_bytes: usize,  // +0x08: bytes per row (8 bytes)
+    info: SkImageInfo, // +0x10: image info (24 bytes)
 }
 
 /// SkBitmap - main bitmap class (56 bytes)
 #[repr(C)]
 #[derive(Debug, Clone)]
 struct SkBitmap {
-    pixel_ref: *const std::ffi::c_void,  // +0x00: sk_sp<SkPixelRef> (8 bytes)
-    pixmap: SkPixmap,                     // +0x08: embedded SkPixmap (40 bytes)
-    flags: u8,                            // +0x30: flags (1 byte)
-    _padding: [u8; 7],                    // +0x31: alignment padding (7 bytes)
+    pixel_ref: *const std::ffi::c_void, // +0x00: sk_sp<SkPixelRef> (8 bytes)
+    pixmap: SkPixmap,                   // +0x08: embedded SkPixmap (40 bytes)
+    flags: u8,                          // +0x30: flags (1 byte)
+    _padding: [u8; 7],                  // +0x31: alignment padding (7 bytes)
 }
 
 impl SkBitmap {
@@ -162,7 +162,6 @@ impl NativeOCR {
         // Look for chrome_screen_ai.dll in multiple locations
         let chrome_dll_path = Self::find_dll(model_dir)?;
 
-
         // Set global model dir for callbacks
         unsafe {
             MODEL_DIR = Some(model_dir.to_string_lossy().to_string());
@@ -250,9 +249,9 @@ impl NativeOCR {
         let mut bgra_pixels = Vec::with_capacity((w * h * 4) as usize);
         for pixel in image.as_raw() {
             let v = *pixel;
-            bgra_pixels.push(v);   // B
-            bgra_pixels.push(v);   // G
-            bgra_pixels.push(v);   // R
+            bgra_pixels.push(v); // B
+            bgra_pixels.push(v); // G
+            bgra_pixels.push(v); // R
             bgra_pixels.push(255); // A
         }
 
