@@ -3,6 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
 
+mod cluster_sort;
 mod detector;
 mod native_ocr;
 mod ocr;
@@ -32,7 +33,7 @@ struct Args {
     model_dir: Option<PathBuf>,
 
     /// Minimum confidence threshold
-    #[arg(long, default_value = "0.3")]
+    #[arg(long, default_value = "0.7")]
     min_conf: f32,
 
     /// Use native chrome_screen_ai.dll instead of TFLite

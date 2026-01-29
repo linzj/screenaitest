@@ -8,6 +8,12 @@ use crate::utils::BBox;
 
 const TARGET_SIZE: u32 = 4096;
 
+// Anchor values from protobuf config:
+// gocr_group_rpn_text_detection_config_2024_q4_chrome.binarypb
+// These are base box sizes in 4096x4096 coordinate space
+const ANCHOR_WIDTHS: [f32; 6] = [16.0, 64.0, 16.0, 64.0, 64.0, 64.0];
+const ANCHOR_HEIGHTS: [f32; 6] = [16.0, 64.0, 16.0, 64.0, 64.0, 64.0];
+
 pub struct TextDetector {
     model: Model<'static>,
     #[allow(dead_code)]
@@ -85,12 +91,8 @@ impl TextDetector {
 
         // Resize if needed and paste
         if self.scale != 1.0 {
-            let resized = image::imageops::resize(
-                image,
-                new_w,
-                new_h,
-                image::imageops::FilterType::Lanczos3,
-            );
+            let resized =
+                image::imageops::resize(image, new_w, new_h, image::imageops::FilterType::Lanczos3);
             image::imageops::overlay(
                 &mut canvas,
                 &resized,
@@ -147,8 +149,20 @@ impl TextDetector {
         interpreter.invoke()?;
 
         // Parse outputs - look for feature maps with shape [1, H, W, 7]
+        // Channel meanings (from IDA analysis):
+        // - Channel 0: Confidence score
+        // - Channels 1-2: Center offsets (dx, dy)
+        // - Channels 3-4: Size deltas (log_width, log_height) - need exp()
+        // - Channels 5-6: Rotation (cos, sin) - ignored for now
         let mut boxes = Vec::new();
         let output_count = interpreter.output_tensor_count();
+
+        // For debugging channel statistics
+        let mut channel_stats: Vec<(f32, f32)> = vec![(f32::MAX, f32::MIN); 7];
+        let mut high_conf_count = 0;
+
+        // Track anchor index for each valid output
+        let mut anchor_idx = 0usize;
 
         for output_idx in 0..output_count {
             let tensor = interpreter.output(output_idx)?;
@@ -159,20 +173,73 @@ impl TextDetector {
                 let feat_h = dims[1];
                 let feat_w = dims[2];
 
+                // Calculate stride (subsampling factor)
+                let stride = TARGET_SIZE as f32 / feat_h as f32;
+
+                // Get anchor values for this output scale
+                // Anchor index wraps around if we have more outputs than anchors
+                let anchor_w = ANCHOR_WIDTHS[anchor_idx % ANCHOR_WIDTHS.len()];
+                let anchor_h = ANCHOR_HEIGHTS[anchor_idx % ANCHOR_HEIGHTS.len()];
+                anchor_idx += 1;
+
+                // Skip very coarse feature maps (stride > 200)
+                if stride > 200.0 {
+                    continue;
+                }
+
                 // Get output data as f32
                 let data: &[f32] = tensor.data();
 
                 for y in 0..feat_h {
                     for x in 0..feat_w {
                         let idx = (y * feat_w + x) * 7;
-                        let conf = data[idx];
+                        // Apply sigmoid to convert logit to probability
+                        let logit = data[idx];
+                        let conf = 1.0 / (1.0 + (-logit).exp());
+
+                        // Update channel statistics for high-confidence detections
+                        if conf > threshold {
+                            high_conf_count += 1;
+                            for ch in 0..7 {
+                                let val = data[idx + ch];
+                                if val < channel_stats[ch].0 {
+                                    channel_stats[ch].0 = val;
+                                }
+                                if val > channel_stats[ch].1 {
+                                    channel_stats[ch].1 = val;
+                                }
+                            }
+                        }
 
                         if conf > threshold {
-                            // Calculate center position in 4096 space
-                            let cx = (x as f32 + 0.5) * TARGET_SIZE as f32 / feat_w as f32;
-                            let cy = (y as f32 + 0.5) * TARGET_SIZE as f32 / feat_h as f32;
-                            let bw = TARGET_SIZE as f32 / feat_w as f32 * 1.2;
-                            let bh = TARGET_SIZE as f32 / feat_h as f32 * 1.2;
+                            // Extract channel values
+                            let dx = data[idx + 1]; // Center x offset
+                            let dy = data[idx + 2]; // Center y offset
+                            let log_w = data[idx + 3]; // Log width delta
+                            let log_h = data[idx + 4]; // Log height delta
+                            let rot_cos = data[idx + 5]; // Rotation cosine
+                            let rot_sin = data[idx + 6]; // Rotation sine
+
+                            // Calculate center position
+                            // Formula: (grid + 0.5 + offset) * stride
+                            let cx = (x as f32 + 0.5 + dx) * stride;
+                            let cy = (y as f32 + 0.5 + dy) * stride;
+
+                            // Calculate box size
+                            // IDA analysis shows: width = exp(log_delta) * anchor * stride / scale_factor
+                            // Anchor values [16, 64] are base sizes, stride normalizes to feature map scale
+                            // Using stride directly as scale factor (anchor * stride / 64 ≈ stride for anchor=64)
+                            let bw = (log_w.exp() * stride).clamp(8.0, 512.0);
+                            let bh = (log_h.exp() * stride).clamp(8.0, 256.0);
+
+                            // Calculate rotation angle from cos/sin
+                            let angle = rot_sin.atan2(rot_cos);
+
+                            // NOTE: Chrome does NOT filter by absolute angle here.
+                            // The 30° threshold in decompiled_0x180476920.txt line 696 is
+                            // for angle DIFFERENCE between two boxes during line grouping,
+                            // not individual box rotation. Vertical text (~90°) must pass through.
+                            // Angle compatibility is checked during merge_boxes_to_lines.
 
                             // Check if within content area
                             let scaled_w = image.width() as f32 * self.scale;
@@ -183,17 +250,44 @@ impl TextDetector {
                                 && cy > self.offset_y
                                 && cy < self.offset_y + scaled_h
                             {
-                                boxes.push(BBox::new(
+                                boxes.push(BBox::with_angle(
                                     cx - bw / 2.0,
                                     cy - bh / 2.0,
                                     cx + bw / 2.0,
                                     cy + bh / 2.0,
                                     conf,
+                                    angle,
                                 ));
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // Optionally print statistics (controlled by env var)
+        if std::env::var("CHROME_OCR_DEBUG").is_ok() && high_conf_count > 0 {
+            println!(
+                "  Detection: {} high-conf points, channel ranges:",
+                high_conf_count
+            );
+            for (ch, (min, max)) in channel_stats.iter().enumerate() {
+                println!("    ch{}: [{:.3}, {:.3}]", ch, min, max);
+            }
+
+            if !boxes.is_empty() {
+                let widths: Vec<f32> = boxes.iter().map(|b| b.x2 - b.x1).collect();
+                let heights: Vec<f32> = boxes.iter().map(|b| b.y2 - b.y1).collect();
+                let min_w = widths.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_w = widths.iter().cloned().fold(0.0, f32::max);
+                let min_h = heights.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_h = heights.iter().cloned().fold(0.0, f32::max);
+                let avg_w = widths.iter().sum::<f32>() / widths.len() as f32;
+                let avg_h = heights.iter().sum::<f32>() / heights.len() as f32;
+                println!(
+                    "  Box sizes: w=[{:.0}..{:.0}], avg={:.0}; h=[{:.0}..{:.0}], avg={:.0}",
+                    min_w, max_w, avg_w, min_h, max_h, avg_h
+                );
             }
         }
 

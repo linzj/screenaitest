@@ -195,6 +195,7 @@ pub struct BBox {
     pub x2: f32,
     pub y2: f32,
     pub conf: f32,
+    pub angle: f32, // Rotation angle in radians
 }
 
 impl BBox {
@@ -205,6 +206,18 @@ impl BBox {
             x2,
             y2,
             conf,
+            angle: 0.0,
+        }
+    }
+
+    pub fn with_angle(x1: f32, y1: f32, x2: f32, y2: f32, conf: f32, angle: f32) -> Self {
+        Self {
+            x1,
+            y1,
+            x2,
+            y2,
+            conf,
+            angle,
         }
     }
 

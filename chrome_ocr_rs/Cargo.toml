@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # Image processing
 image = "0.25"
+imageproc = "0.25"
 
 # CLI and utilities
 clap = { version = "4", features = ["derive"] }

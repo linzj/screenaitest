@@ -1,8 +1,11 @@
 use anyhow::Result;
-use image::GrayImage;
+use image::{GrayImage, Luma};
+use imageproc::geometric_transformations::{rotate_about_center, Interpolation};
 use std::path::Path;
 use std::time::Instant;
 
+#[allow(unused_imports)]
+use crate::cluster_sort::ClusterSort;
 use crate::detector::TextDetector;
 use crate::recognizer::LineRecognizer;
 use crate::sorter::LayoutSorter;
@@ -28,6 +31,7 @@ pub struct ChromeOCR {
     detector: TextDetector,
     recognizer: LineRecognizer,
     sorter: LayoutSorter,
+    cluster_sort: ClusterSort,
     save_lines: bool,
     min_conf: f32,
     perf: bool,
@@ -55,14 +59,18 @@ impl ChromeOCR {
         stats.load_recognizer = t2.elapsed().as_secs_f64();
         println!("  LineRecognizer: loaded");
 
+        let cluster_sort = ClusterSort::new(model_dir)?;
+        println!("  ClusterSort: loaded");
+
         println!("All models loaded!");
 
         Ok(Self {
             detector,
             recognizer,
             sorter,
+            cluster_sort,
             save_lines: false,
-            min_conf: 0.3,
+            min_conf: 0.7,
             perf,
             stats,
         })
@@ -130,7 +138,7 @@ impl ChromeOCR {
             TARGET_SIZE, TARGET_SIZE
         );
         let t0 = Instant::now();
-        let boxes = self.detector.detect(&image, 0.5)?;
+        let boxes = self.detector.detect(&image, 0.3)?;
         self.stats.detection = t0.elapsed().as_secs_f64();
         println!("  Found {} char-level regions", boxes.len());
         println!("  Scale factor: {:.2}x", self.detector.scale);
@@ -140,6 +148,31 @@ impl ChromeOCR {
         let merged = self.merge_boxes_to_lines(&boxes);
         self.stats.merge = t1.elapsed().as_secs_f64();
         println!("  Merged to {} lines", merged.len());
+
+        // Print merged line dimensions
+        if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+            let dbg_scale = self.detector.scale;
+            let dbg_ox = self.detector.offset_x;
+            let dbg_oy = self.detector.offset_y;
+            for (i, bbox) in merged.iter().enumerate() {
+                let ox1 = ((bbox.x1 - dbg_ox) / dbg_scale) as i32;
+                let oy1 = ((bbox.y1 - dbg_oy) / dbg_scale) as i32;
+                let ox2 = ((bbox.x2 - dbg_ox) / dbg_scale) as i32;
+                let oy2 = ((bbox.y2 - dbg_oy) / dbg_scale) as i32;
+                let angle_deg = bbox.angle.to_degrees();
+                println!(
+                    "    M{}: ({},{})→({},{}) {}x{} angle={:.1}°",
+                    i + 1,
+                    ox1,
+                    oy1,
+                    ox2,
+                    oy2,
+                    ox2 - ox1,
+                    oy2 - oy1,
+                    angle_deg
+                );
+            }
+        }
 
         // Step 2: Layout Sorting
         println!("\n[2/3] Layout Sorting...");
@@ -185,10 +218,17 @@ impl ChromeOCR {
             let mut x2 = ((bbox.x2 - offset_x) / scale) as i32;
             let mut y2 = ((bbox.y2 - offset_y) / scale) as i32;
 
-            x1 = x1.max(0);
-            y1 = y1.max(0);
-            x2 = x2.min(width as i32);
-            y2 = y2.min(height as i32);
+            // Chrome pads boxes before recognition: clamp(height * scale_factor, 4.0, 16.0)
+            // From IDA analysis of sub_18048ACD0 (region_proposal_text_detector.cc)
+            // Since our char-level grouping may miss edge chars, use box_height/3
+            // as padding (approximately one char width) to compensate
+            let box_h = (y2 - y1) as f32;
+            let pad_x = (box_h / 3.0).clamp(10.0, 40.0) as i32;
+            let pad_y = (box_h / 6.0).clamp(4.0, 16.0) as i32;
+            x1 = (x1 - pad_x).max(0);
+            y1 = (y1 - pad_y).max(0);
+            x2 = (x2 + pad_x).min(width as i32);
+            y2 = (y2 + pad_y).min(height as i32);
 
             if x2 - x1 < 10 || y2 - y1 < 5 {
                 continue;
@@ -202,15 +242,111 @@ impl ChromeOCR {
                 y2 = (y2 + expand).min(height as i32);
             }
 
-            // Crop region
+            // Crop region with extra padding for rotation if needed
+            let angle = bbox.angle;
+            let need_rotation = angle.abs() > 0.05; // > ~3 degrees
+
+            // For rotation: the bbox is axis-aligned and contains the rotated text
+            // We need padding to ensure the text isn't cut off during deskewing
+            let (pad_x, pad_y) = if need_rotation {
+                let w = (x2 - x1) as f32;
+                let h = (y2 - y1) as f32;
+                let sin_a = angle.abs().sin();
+                let cos_a = angle.abs().cos();
+                // After rotation, the bbox expands: new_w = w*cos + h*sin
+                // Add generous padding to ensure nothing is cut off
+                let extra_w = (h * sin_a + w * (1.0 - cos_a)) / 2.0 + 20.0;
+                let extra_h = (w * sin_a + h * (1.0 - cos_a)) / 2.0 + 15.0;
+                (extra_w as i32, extra_h as i32)
+            } else {
+                (0, 0)
+            };
+
+            let crop_x1 = (x1 - pad_x).max(0);
+            let crop_y1 = (y1 - pad_y).max(0);
+            let crop_x2 = (x2 + pad_x).min(width as i32);
+            let crop_y2 = (y2 + pad_y).min(height as i32);
+
             let region = image::imageops::crop_imm(
                 &image,
-                x1 as u32,
-                y1 as u32,
-                (x2 - x1) as u32,
-                (y2 - y1) as u32,
+                crop_x1 as u32,
+                crop_y1 as u32,
+                (crop_x2 - crop_x1) as u32,
+                (crop_y2 - crop_y1) as u32,
             )
             .to_image();
+
+            // Deskew region if significant rotation detected
+            // Use rotate_about_center, then track bbox center to extract the right region
+            let region = if need_rotation {
+                // Calculate where the original bbox center is within the cropped region
+                let bbox_w = (x2 - x1) as f32;
+                let bbox_h = (y2 - y1) as f32;
+                let crop_w = region.width() as f32;
+                let crop_h = region.height() as f32;
+
+                // Bbox center relative to crop origin
+                let bbox_cx_in_crop = (x1 - crop_x1) as f32 + bbox_w / 2.0;
+                let bbox_cy_in_crop = (y1 - crop_y1) as f32 + bbox_h / 2.0;
+
+                // Crop center
+                let crop_cx = crop_w / 2.0;
+                let crop_cy = crop_h / 2.0;
+
+                // Offset from crop center to bbox center
+                let offset_x = bbox_cx_in_crop - crop_cx;
+                let offset_y = bbox_cy_in_crop - crop_cy;
+
+                // Rotate the entire crop around its center
+                let rotated =
+                    rotate_about_center(&region, -angle, Interpolation::Bilinear, Luma([255u8]));
+                let (rw, rh) = (rotated.width(), rotated.height());
+
+                // After rotation, the offset from center also rotates
+                let cos_a = (-angle).cos();
+                let sin_a = (-angle).sin();
+                let new_offset_x = offset_x * cos_a - offset_y * sin_a;
+                let new_offset_y = offset_x * sin_a + offset_y * cos_a;
+
+                // Bbox center in rotated image
+                let rotated_cx = rw as f32 / 2.0;
+                let rotated_cy = rh as f32 / 2.0;
+                let bbox_cx_in_rotated = rotated_cx + new_offset_x;
+                let bbox_cy_in_rotated = rotated_cy + new_offset_y;
+
+                // For near-vertical text (angle > 45°), after rotation the original
+                // narrow width becomes the text height. Must use rotated dimensions.
+                // For moderate angles (< 45°), original dimensions are tighter and work well.
+                let is_near_vertical = angle.abs() > std::f32::consts::FRAC_PI_4;
+                let (crop_base_w, crop_base_h) = if is_near_vertical {
+                    let rot_cos = cos_a.abs();
+                    let rot_sin = sin_a.abs();
+                    (
+                        bbox_w * rot_cos + bbox_h * rot_sin,
+                        bbox_w * rot_sin + bbox_h * rot_cos,
+                    )
+                } else {
+                    (bbox_w, bbox_h)
+                };
+
+                let angle_factor = (angle.abs() * 3.0).min(1.0);
+                let edge_margin_x = 3.0 + angle_factor * 4.0; // 3-7 pixels
+                let edge_margin_y = 2.0 + angle_factor * 2.0; // 2-4 pixels
+                let crop_w = crop_base_w + edge_margin_x * 2.0;
+                let crop_h = crop_base_h + edge_margin_y * 2.0;
+                let tx1 = ((bbox_cx_in_rotated - crop_w / 2.0).max(0.0)) as u32;
+                let ty1 = ((bbox_cy_in_rotated - crop_h / 2.0).max(0.0)) as u32;
+                let tx2 = ((bbox_cx_in_rotated + crop_w / 2.0).min(rw as f32)) as u32;
+                let ty2 = ((bbox_cy_in_rotated + crop_h / 2.0).min(rh as f32)) as u32;
+
+                if tx2 > tx1 + 10 && ty2 > ty1 + 5 {
+                    image::imageops::crop_imm(&rotated, tx1, ty1, tx2 - tx1, ty2 - ty1).to_image()
+                } else {
+                    rotated
+                }
+            } else {
+                region
+            };
 
             // Split multi-line regions
             let sub_regions = self.split_multiline_region(&region);
@@ -300,6 +436,9 @@ impl ChromeOCR {
                         });
 
                 if is_duplicate {
+                    if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                        println!("    [SKIP] y={} duplicate", actual_y);
+                    }
                     continue;
                 }
 
@@ -312,24 +451,63 @@ impl ChromeOCR {
                 // Post-process to clean up artifacts
                 let text = Self::post_process_text(&text);
 
-                // Filter out very short fragments (likely noise)
+                // Filter out empty, single-char, or low-confidence results
+                // Chrome's GroupDetectionBoxes merges chars to lines - single chars are noise
                 let text_len = text.chars().count();
-                if text_len >= 2 && conf >= self.min_conf {
-                    line_num += 1;
-                    recognized_lines.push((x1, actual_y, sub_w, sub_h, conf));
-
-                    // Save line image
-                    if let Some(ref dir) = lines_dir {
-                        let line_path = dir.join(format!("line_{:03}.png", line_num));
-                        sub_region.save(&line_path)?;
+                if text_len < 2 || conf < self.min_conf {
+                    if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                        println!(
+                            "    [SKIP] y={} len={} conf={:.2}: {}",
+                            actual_y, text_len, conf, text
+                        );
                     }
-
-                    println!(
-                        "  L{} (y={:4}) conf={:.2}: {}",
-                        line_num, actual_y, conf, text
-                    );
-                    results.push(text);
+                    continue;
                 }
+
+                // Check for text-based duplicates (same or very similar text)
+                let is_text_duplicate = results.iter().any(|prev_text: &String| {
+                    // Exact match
+                    if prev_text == &text {
+                        return true;
+                    }
+                    // One is substring of the other (for partial matches)
+                    let shorter = if prev_text.len() < text.len() {
+                        prev_text
+                    } else {
+                        &text
+                    };
+                    let longer = if prev_text.len() >= text.len() {
+                        prev_text
+                    } else {
+                        &text
+                    };
+                    if shorter.chars().count() >= 3 && longer.contains(shorter.as_str()) {
+                        return true;
+                    }
+                    false
+                });
+
+                if is_text_duplicate {
+                    if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                        println!("    [SKIP] y={} text duplicate: {}", actual_y, text);
+                    }
+                    continue;
+                }
+
+                line_num += 1;
+                recognized_lines.push((x1, actual_y, sub_w, sub_h, conf));
+
+                // Save line image
+                if let Some(ref dir) = lines_dir {
+                    let line_path = dir.join(format!("line_{:03}.png", line_num));
+                    sub_region.save(&line_path)?;
+                }
+
+                println!(
+                    "  L{} (y={:4}) conf={:.2}: {}",
+                    line_num, actual_y, conf, text
+                );
+                results.push(text);
             }
         }
 
@@ -341,98 +519,470 @@ impl ChromeOCR {
         Ok(results)
     }
 
-    /// Merge detection boxes into lines
+    /// Merge detection boxes into lines using Hough Transform-based greedy expansion.
+    /// Based on Chrome's GroupingBoxesHoughTransform (sub_18049E3B0) from IDA analysis.
+    ///
+    /// Chrome algorithm (from IDA reverse engineering):
+    ///   1. Build spatial hash grid (cell_size = avg_dim * 2)
+    ///   2. For each unvisited box, grow a line cluster by directional expansion
+    ///   3. Neighbor search constraints (from sub_1804AEA00):
+    ///      - height_ratio <= 1.5 (config+96)
+    ///      - perpendicular distance <= 0.3 * min_h (config+100)
+    ///      - gap along direction <= 1.5 * avg_height (config+104)
+    ///   4. Merge overlapping line hypotheses (IoU >= 0.1, config+128)
+    ///
+    /// Key difference from pairwise Union-Find: greedy directional expansion
+    /// prevents transitive cross-line merging in radial text layouts.
     fn merge_boxes_to_lines(&self, boxes: &[BBox]) -> Vec<BBox> {
         if boxes.is_empty() {
             return Vec::new();
         }
 
-        // Calculate center and size for each box
-        let mut boxes_with_info: Vec<_> = boxes
-            .iter()
-            .map(|b| {
-                let (cx, cy) = b.center();
-                (b.clone(), cx, cy, b.width(), b.height())
-            })
-            .collect();
+        let n = boxes.len();
 
-        // Sort by y then x
-        boxes_with_info.sort_by(|a, b| {
-            a.2.partial_cmp(&b.2)
+        // Compute average dimensions (from sub_18049AE80)
+        let avg_height: f32 = boxes.iter().map(|b| b.height()).sum::<f32>() / n as f32;
+        let avg_width: f32 = boxes.iter().map(|b| b.width()).sum::<f32>() / n as f32;
+
+        // Chrome config: cell_size_portion = 2 (config+152, config+156)
+        let cell_w = (avg_width * 2.0).max(1.0);
+        let cell_h = (avg_height * 2.0).max(1.0);
+
+        // Build spatial hash grid (from sub_18049AE80)
+        // Key: grid_cols * row + col -> Vec<usize>
+        let grid_cols = (4096.0 / cell_w) as i32 + 1;
+        let mut spatial_hash: std::collections::HashMap<i32, Vec<usize>> =
+            std::collections::HashMap::new();
+
+        for (idx, b) in boxes.iter().enumerate() {
+            let (cx, cy) = b.center();
+            let col = (cx / cell_w) as i32;
+            let row = (cy / cell_h) as i32;
+            let key = grid_cols * row + col;
+            spatial_hash.entry(key).or_default().push(idx);
+        }
+
+        // Greedy line expansion (based on Chrome's main loop in sub_18049E3B0, lines 907-1330)
+        let mut visited = vec![false; n];
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+
+        // Process boxes in confidence order (Chrome sorts by score, line 435-633)
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            boxes[b]
+                .conf
+                .partial_cmp(&boxes[a].conf)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         });
 
-        // Merge adjacent boxes
-        let mut merged = Vec::new();
-        let mut used = vec![false; boxes_with_info.len()];
-
-        for i in 0..boxes_with_info.len() {
-            if used[i] {
+        for &seed_idx in &order {
+            if visited[seed_idx] {
                 continue;
             }
+            visited[seed_idx] = true;
 
-            let mut group = vec![i];
-            used[i] = true;
+            let seed = &boxes[seed_idx];
+            let seed_angle = seed.angle;
+            let cos_a = seed_angle.cos();
+            let sin_a = seed_angle.sin();
 
-            // Iteratively expand group
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for j in 0..boxes_with_info.len() {
-                    if used[j] {
-                        continue;
+            let mut cluster = vec![seed_idx];
+
+            // Expand in both directions (+1 forward, -1 backward)
+            // Chrome's sub_1804AEA00 is called twice: forward and backward
+            for direction in &[1.0f32, -1.0f32] {
+                // Start from the seed's position
+                let (mut cur_cx, mut cur_cy) = seed.center();
+                let mut cur_w = seed.width();
+                let mut cur_h = seed.height();
+
+                // Iterative expansion along line direction
+                let max_steps = 200; // Safety limit
+                for _step in 0..max_steps {
+                    let mut found_neighbor = false;
+                    let mut best_idx = 0usize;
+                    let mut best_along_dist = f32::MAX;
+
+                    // Project search position along line direction
+                    let search_cx = cur_cx + direction * cos_a * (cur_w * 0.5 + avg_width);
+                    let search_cy = cur_cy + direction * sin_a * (cur_w * 0.5 + avg_width);
+
+                    // Search neighboring grid cells (3x3 around projected position)
+                    let search_col = (search_cx / cell_w) as i32;
+                    let search_row = (search_cy / cell_h) as i32;
+
+                    for dr in -1..=1 {
+                        for dc in -1..=1 {
+                            let key = grid_cols * (search_row + dr) + (search_col + dc);
+                            if let Some(cell_indices) = spatial_hash.get(&key) {
+                                for &cand_idx in cell_indices {
+                                    if visited[cand_idx] {
+                                        continue;
+                                    }
+
+                                    let cand = &boxes[cand_idx];
+
+                                    // Chrome config+96: height_ratio <= 1.5
+                                    let h_ratio = if cur_h > cand.height() {
+                                        cur_h / cand.height()
+                                    } else {
+                                        cand.height() / cur_h
+                                    };
+                                    if h_ratio > 1.5 {
+                                        continue;
+                                    }
+
+                                    let (cand_cx, cand_cy) = cand.center();
+                                    let dx = cand_cx - cur_cx;
+                                    let dy = cand_cy - cur_cy;
+
+                                    // Chrome config+100: perpendicular distance <= 0.3 * min_h
+                                    let perp = (dx * (-sin_a) + dy * cos_a).abs();
+                                    let min_h = cur_h.min(cand.height());
+                                    if perp > min_h * 0.3 {
+                                        continue;
+                                    }
+
+                                    // Along-line distance (signed by direction)
+                                    let along = (dx * cos_a + dy * sin_a) * direction;
+
+                                    // Must be in the expansion direction (along > 0)
+                                    // and gap must be reasonable
+                                    if along < -cur_w * 0.5 {
+                                        continue; // Behind current box
+                                    }
+
+                                    // Chrome config+104: gap <= 1.5 * avg_height
+                                    let gap = along - (cur_w + cand.width()) * 0.5;
+                                    if gap > avg_height * 1.5 {
+                                        continue;
+                                    }
+
+                                    // Angle check (30 degrees from Chrome config)
+                                    let angle_diff = (seed_angle - cand.angle).abs().to_degrees();
+                                    let angle_diff = if angle_diff > 180.0 {
+                                        360.0 - angle_diff
+                                    } else {
+                                        angle_diff
+                                    };
+                                    if angle_diff > 30.0 {
+                                        continue;
+                                    }
+
+                                    // Pick closest neighbor in expansion direction
+                                    if along < best_along_dist {
+                                        best_along_dist = along;
+                                        best_idx = cand_idx;
+                                        found_neighbor = true;
+                                    }
+                                }
+                            }
+                        }
                     }
 
-                    let other = &boxes_with_info[j];
-
-                    // Check if adjacent to any box in group
-                    for &g_idx in &group {
-                        let g = &boxes_with_info[g_idx];
-
-                        let x_dist = (other.1 - g.1).abs();
-                        let y_dist = (other.2 - g.2).abs();
-                        let x_thresh = other.3 + g.3; // x distance < sum of widths
-                                                      // Chrome uses maximum_depth_gap=1.5 relative to avg height
-                                                      // Use 0.5 * combined heights for more aggressive merging
-                        let y_thresh = (other.4 + g.4) * 0.5;
-
-                        if x_dist < x_thresh && y_dist < y_thresh {
-                            group.push(j);
-                            used[j] = true;
-                            changed = true;
-                            break;
-                        }
+                    if found_neighbor {
+                        visited[best_idx] = true;
+                        cluster.push(best_idx);
+                        // Update current position to the newly added box
+                        let added = &boxes[best_idx];
+                        cur_cx = added.center().0;
+                        cur_cy = added.center().1;
+                        cur_w = added.width();
+                        cur_h = added.height();
+                    } else {
+                        break; // No more neighbors in this direction
                     }
                 }
             }
 
-            // Merge group into single box
-            if !group.is_empty() {
-                let x1 = group
-                    .iter()
-                    .map(|&i| boxes_with_info[i].0.x1)
-                    .fold(f32::INFINITY, f32::min);
-                let y1 = group
-                    .iter()
-                    .map(|&i| boxes_with_info[i].0.y1)
-                    .fold(f32::INFINITY, f32::min);
-                let x2 = group
-                    .iter()
-                    .map(|&i| boxes_with_info[i].0.x2)
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let y2 = group
-                    .iter()
-                    .map(|&i| boxes_with_info[i].0.y2)
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let conf = group
-                    .iter()
-                    .map(|&i| boxes_with_info[i].0.conf)
-                    .fold(0.0f32, f32::max);
+            clusters.push(cluster);
+        }
 
-                merged.push(BBox::new(x1, y1, x2, y2, conf));
+        if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+            let total_assigned: usize = clusters.iter().map(|c| c.len()).sum();
+            println!(
+                "  [DBG] {} clusters from greedy expansion ({}/{} boxes assigned)",
+                clusters.len(),
+                total_assigned,
+                n
+            );
+            // Count singleton clusters
+            let singletons = clusters.iter().filter(|c| c.len() == 1).count();
+            println!("  [DBG] {} singleton clusters", singletons);
+        }
+
+        // Merge overlapping line hypotheses using Union-Find (Chrome config+128: IoU >= 0.1)
+        // This handles cases where the same line is discovered from different seed boxes
+        let num_clusters = clusters.len();
+        let mut cl_parent: Vec<usize> = (0..num_clusters).collect();
+
+        fn find_cl(parent: &mut [usize], i: usize) -> usize {
+            if parent[i] != i {
+                parent[i] = find_cl(parent, parent[i]);
+            }
+            parent[i]
+        }
+
+        // Compute bounding box and angle for each cluster
+        let cluster_bboxes: Vec<[f32; 4]> = clusters
+            .iter()
+            .map(|cl| {
+                let x1 = cl
+                    .iter()
+                    .map(|&i| boxes[i].x1)
+                    .fold(f32::INFINITY, f32::min);
+                let y1 = cl
+                    .iter()
+                    .map(|&i| boxes[i].y1)
+                    .fold(f32::INFINITY, f32::min);
+                let x2 = cl
+                    .iter()
+                    .map(|&i| boxes[i].x2)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let y2 = cl
+                    .iter()
+                    .map(|&i| boxes[i].y2)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                [x1, y1, x2, y2]
+            })
+            .collect();
+
+        let cluster_angles: Vec<f32> = clusters
+            .iter()
+            .map(|cl| {
+                let (ss, sc): (f32, f32) = cl
+                    .iter()
+                    .map(|&i| (boxes[i].angle.sin(), boxes[i].angle.cos()))
+                    .fold((0.0, 0.0), |(s, c), (ds, dc)| (s + ds, c + dc));
+                ss.atan2(sc)
+            })
+            .collect();
+
+        let cluster_avg_h: Vec<f32> = clusters
+            .iter()
+            .map(|cl| cl.iter().map(|&i| boxes[i].height()).sum::<f32>() / cl.len() as f32)
+            .collect();
+
+        // Pass 1: Merge overlapping clusters (IoU >= 0.1 or containment > 0.5)
+        for i in 0..num_clusters {
+            for j in (i + 1)..num_clusters {
+                let ri = find_cl(&mut cl_parent, i);
+                let rj = find_cl(&mut cl_parent, j);
+                if ri == rj {
+                    continue;
+                }
+                // Chrome config+128: grouping_box_overlap = 0.1
+                let iou = calc_iou(&cluster_bboxes[i], &cluster_bboxes[j]);
+                if iou >= 0.1 {
+                    cl_parent[rj] = ri;
+                    continue;
+                }
+                // Also merge if one cluster is mostly contained in another
+                let cont_ij = calc_containment(&cluster_bboxes[i], &cluster_bboxes[j]);
+                let cont_ji = calc_containment(&cluster_bboxes[j], &cluster_bboxes[i]);
+                if cont_ij > 0.5 || cont_ji > 0.5 {
+                    cl_parent[rj] = ri;
+                }
             }
         }
+
+        // Pass 2: Merge small clusters (<=3 boxes) into nearby larger ones along the line
+        // This handles singleton boxes that were processed as seeds before a larger cluster
+        // could absorb them (common in horizontal text bars with gaps)
+        for small_i in 0..num_clusters {
+            if clusters[small_i].len() > 3 {
+                continue; // Only try to merge small clusters
+            }
+            let ri = find_cl(&mut cl_parent, small_i);
+            // Check if already merged into something bigger
+            let root_size: usize = (0..num_clusters)
+                .filter(|&k| find_cl(&mut cl_parent, k) == ri)
+                .map(|k| clusters[k].len())
+                .sum();
+            if root_size > 3 {
+                continue; // Already part of a bigger group
+            }
+
+            let small_bb = &cluster_bboxes[small_i];
+            let small_cx = (small_bb[0] + small_bb[2]) / 2.0;
+            let small_cy = (small_bb[1] + small_bb[3]) / 2.0;
+            let small_h = small_bb[3] - small_bb[1];
+
+            for big_j in 0..num_clusters {
+                if clusters[big_j].len() < 3 {
+                    continue; // Only merge into larger clusters
+                }
+                let rj = find_cl(&mut cl_parent, big_j);
+                if ri == rj {
+                    continue;
+                }
+
+                let big_bb = &cluster_bboxes[big_j];
+                let big_h = big_bb[3] - big_bb[1];
+
+                // Height compatibility
+                let h_ratio = if small_h > big_h {
+                    small_h / big_h
+                } else {
+                    big_h / small_h
+                };
+                if h_ratio > 1.5 {
+                    continue;
+                }
+
+                // Angle compatibility (30 degrees)
+                let angle_diff = (cluster_angles[small_i] - cluster_angles[big_j])
+                    .abs()
+                    .to_degrees();
+                let angle_diff = if angle_diff > 180.0 {
+                    360.0 - angle_diff
+                } else {
+                    angle_diff
+                };
+                if angle_diff > 30.0 {
+                    continue;
+                }
+
+                // Check perpendicular distance from small cluster center to big cluster's line
+                let big_cx = (big_bb[0] + big_bb[2]) / 2.0;
+                let big_cy = (big_bb[1] + big_bb[3]) / 2.0;
+                let big_angle = cluster_angles[big_j];
+                let big_cos = big_angle.cos();
+                let big_sin = big_angle.sin();
+
+                let dx = small_cx - big_cx;
+                let dy = small_cy - big_cy;
+                let perp = (dx * (-big_sin) + dy * big_cos).abs();
+                let min_h = small_h.min(big_h);
+
+                if perp > min_h * 0.3 {
+                    continue;
+                }
+
+                // Check gap along line direction
+                let along = (dx * big_cos + dy * big_sin).abs();
+                let big_w = big_bb[2] - big_bb[0];
+                let small_w = small_bb[2] - small_bb[0];
+                let gap = along - (big_w + small_w) * 0.5;
+                if gap > avg_height * 1.5 {
+                    continue;
+                }
+
+                // Merge small into big
+                let small_root = find_cl(&mut cl_parent, small_i);
+                cl_parent[small_root] = rj;
+                break; // Only merge into one cluster
+            }
+        }
+
+        // Collect merged clusters
+        let mut merged_clusters: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for i in 0..num_clusters {
+            let root = find_cl(&mut cl_parent, i);
+            merged_clusters
+                .entry(root)
+                .or_default()
+                .extend(clusters[i].iter());
+        }
+
+        // Debug output
+        if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+            for (root, indices) in &merged_clusters {
+                if indices.len() > 15 {
+                    let x1 = indices
+                        .iter()
+                        .map(|&i| boxes[i].x1)
+                        .fold(f32::INFINITY, f32::min);
+                    let y1 = indices
+                        .iter()
+                        .map(|&i| boxes[i].y1)
+                        .fold(f32::INFINITY, f32::min);
+                    let x2 = indices
+                        .iter()
+                        .map(|&i| boxes[i].x2)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let y2 = indices
+                        .iter()
+                        .map(|&i| boxes[i].y2)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    println!(
+                        "  [DBG] Large group root={}: {} members, bbox=({:.0},{:.0})→({:.0},{:.0})",
+                        root,
+                        indices.len(),
+                        x1,
+                        y1,
+                        x2,
+                        y2
+                    );
+                }
+            }
+        }
+
+        // Create merged boxes from clusters
+        let mut merged = Vec::new();
+        for indices in merged_clusters.values() {
+            let x1 = indices
+                .iter()
+                .map(|&i| boxes[i].x1)
+                .fold(f32::INFINITY, f32::min);
+            let y1 = indices
+                .iter()
+                .map(|&i| boxes[i].y1)
+                .fold(f32::INFINITY, f32::min);
+            let x2 = indices
+                .iter()
+                .map(|&i| boxes[i].x2)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let y2 = indices
+                .iter()
+                .map(|&i| boxes[i].y2)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let conf = indices
+                .iter()
+                .map(|&i| boxes[i].conf)
+                .fold(0.0f32, f32::max);
+            let (sum_sin, sum_cos): (f32, f32) = indices
+                .iter()
+                .map(|&i| {
+                    let b = &boxes[i];
+                    (b.angle.sin() * b.conf, b.angle.cos() * b.conf)
+                })
+                .fold((0.0, 0.0), |(s, c), (ds, dc)| (s + ds, c + dc));
+            let angle = sum_sin.atan2(sum_cos);
+
+            merged.push(BBox::with_angle(x1, y1, x2, y2, conf, angle));
+        }
+
+        // Filter out very small boxes (likely noise)
+        // Chrome: width >= 4 && height > 3 (in original coordinates)
+        if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+            let scale = self.detector.scale;
+            let ox = self.detector.offset_x;
+            let oy = self.detector.offset_y;
+            for b in &merged {
+                if b.width() <= 80.0 || b.height() <= 30.0 {
+                    let orig_x1 = ((b.x1 - ox) / scale) as i32;
+                    let orig_y1 = ((b.y1 - oy) / scale) as i32;
+                    let orig_x2 = ((b.x2 - ox) / scale) as i32;
+                    let orig_y2 = ((b.y2 - oy) / scale) as i32;
+                    println!(
+                        "  [FILTERED] ({},{})→({},{}) {}x{} angle={:.1}°",
+                        orig_x1,
+                        orig_y1,
+                        orig_x2,
+                        orig_y2,
+                        b.width() as i32,
+                        b.height() as i32,
+                        b.angle.to_degrees()
+                    );
+                }
+            }
+        }
+        let merged: Vec<BBox> = merged
+            .into_iter()
+            .filter(|b| b.width() > 80.0 && b.height() > 30.0)
+            .collect();
 
         // Apply NMS to remove overlapping boxes (iou_threshold=0.5)
         self.nms_merged_boxes(merged, 0.5)

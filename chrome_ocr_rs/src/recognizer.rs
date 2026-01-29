@@ -6,8 +6,10 @@ use tflitec::model::Model;
 
 const MODEL_HEIGHT: u32 = 32;
 const MODEL_WIDTH: u32 = 168;
-const LEFT_MARGIN: u32 = 12; // Left margin for TFLite model (different from ONNX)
-const EFFECTIVE_WIDTH: u32 = MODEL_WIDTH - LEFT_MARGIN; // 156
+// LEFT_MARGIN is needed! Testing showed LEFT_MARGIN=0 causes MORE first char losses.
+// The model expects some padding on the left for proper character alignment.
+const LEFT_MARGIN: u32 = 12; // 12 pixels left margin for TFLite model
+const EFFECTIVE_WIDTH: u32 = MODEL_WIDTH - LEFT_MARGIN; // 156 effective width
 const CHAR_CONF_THRESHOLD: f32 = 0.15; // Filter low-confidence characters
 const BLANK_IDX: usize = 8178; // Blank token index
 const FRAME_WIDTH: u32 = 4; // 168 pixels / 42 time steps = 4 pixels per frame
@@ -208,11 +210,7 @@ impl LineRecognizer {
     }
 
     /// Get raw logits from a chunk (for tensor-level merging)
-    fn get_chunk_logits(
-        &self,
-        image: &GrayImage,
-        interpreter: &Interpreter,
-    ) -> Result<Vec<f32>> {
+    fn get_chunk_logits(&self, image: &GrayImage, interpreter: &Interpreter) -> Result<Vec<f32>> {
         let (w, h) = (image.width(), image.height());
 
         // Scale to height 32
@@ -226,7 +224,8 @@ impl LineRecognizer {
             image::imageops::FilterType::Lanczos3,
         );
 
-        // Create canvas with left margin
+        // Create canvas with left margin for model alignment
+        // Note: Chrome does NOT invert images - uses original grayscale values
         let mut canvas: GrayImage =
             ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, Luma([255u8]));
         image::imageops::overlay(&mut canvas, &scaled, LEFT_MARGIN as i64, 0);
@@ -510,7 +509,22 @@ impl LineRecognizer {
             image::imageops::FilterType::Lanczos3,
         );
 
-        // Create canvas with left margin
+        // Debug: check average pixel values
+        if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+            let avg: u32 = scaled.pixels().map(|p| p.0[0] as u32).sum::<u32>()
+                / (scaled.width() * scaled.height());
+            let first_col_avg: u32 = (0..scaled.height())
+                .map(|y| scaled.get_pixel(0, y).0[0] as u32)
+                .sum::<u32>()
+                / scaled.height();
+            eprintln!(
+                "  [REC] scaled {}x{}, avg_pixel={}, first_col_avg={}",
+                new_w, MODEL_HEIGHT, avg, first_col_avg
+            );
+        }
+
+        // Create canvas with left margin for model alignment
+        // Note: Chrome does NOT invert images - uses original grayscale values (from IDA analysis)
         let mut canvas: GrayImage =
             ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, Luma([255u8]));
         image::imageops::overlay(&mut canvas, &scaled, LEFT_MARGIN as i64, 0);
@@ -540,7 +554,8 @@ impl LineRecognizer {
             image::imageops::FilterType::Lanczos3,
         );
 
-        // Create canvas with left margin
+        // Create canvas with left margin for model alignment
+        // Note: Chrome does NOT invert images - uses original grayscale values (from IDA analysis)
         let mut canvas: GrayImage =
             ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, Luma([255u8]));
         image::imageops::overlay(&mut canvas, &scaled, LEFT_MARGIN as i64, 0);
