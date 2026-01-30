@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use image::{GrayImage, ImageBuffer, Luma};
+use std::collections::HashMap;
 use std::path::Path;
 use tflitec::interpreter::{Interpreter, Options};
 use tflitec::model::Model;
@@ -9,9 +10,10 @@ const MODEL_WIDTH: u32 = 168;
 // LEFT_MARGIN is needed! Testing showed LEFT_MARGIN=0 causes MORE first char losses.
 // The model expects some padding on the left for proper character alignment.
 const LEFT_MARGIN: u32 = 12; // 12 pixels left margin for TFLite model
-const EFFECTIVE_WIDTH: u32 = MODEL_WIDTH - LEFT_MARGIN; // 156 effective width
-const CHAR_CONF_THRESHOLD: f32 = 0.15; // Filter low-confidence characters
-const BLANK_IDX: usize = 8178; // Blank token index
+                             // EFFECTIVE_WIDTH is now computed per-model via self.effective_width()
+const CHAR_CONF_THRESHOLD: f32 = 0.15; // Filter low-confidence characters (CJK model)
+                                       // Chrome UND config: char_score_threshold=0 (no filtering)
+const UND_CHAR_CONF_THRESHOLD: f32 = 0.0;
 const FRAME_WIDTH: u32 = 4; // 168 pixels / 42 time steps = 4 pixels per frame
 
 /// Character with position information for Chrome-style deduplication
@@ -37,21 +39,41 @@ pub struct LineRecognizer {
     vocab: Vec<String>,
     time_steps: usize,
     vocab_size: usize,
+    blank_idx: usize,
     output_idx: usize,
     scale_val: f32,
     zero_point: i32,
+    left_margin: u32,
+    pub model_name: String,
 }
 
 impl LineRecognizer {
-    pub fn new(model_dir: &Path) -> Result<Self> {
+    /// Create a recognizer for a specific model
+    /// model_name: "hanijpan" for CJK, "gocr_mobile_und" for universal/Latin
+    pub fn new_with_model(model_dir: &Path, model_name: &str) -> Result<Self> {
         let model_path = model_dir
             .join("gocr")
             .join("gocr_models")
             .join("line_recognition_mobile_convnext320_omni")
-            .join("hanijpan.tflite");
+            .join(format!("{}.tflite", model_name));
 
-        // Look for vocab file - first in current directory, then in model directory
-        let vocab_path = std::path::PathBuf::from("hanijpan_char_map.json");
+        // Look for vocab file in multiple locations
+        let vocab_filename = format!("{}_char_map.json", model_name);
+        let vocab_path = {
+            let cwd_path = std::path::PathBuf::from(&vocab_filename);
+            if cwd_path.exists() {
+                cwd_path
+            } else {
+                // Try next to the executable
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                exe_dir
+                    .map(|d| d.join(&vocab_filename))
+                    .filter(|p| p.exists())
+                    .unwrap_or(cwd_path)
+            }
+        };
 
         if !model_path.exists() {
             return Err(anyhow!(
@@ -64,17 +86,23 @@ impl LineRecognizer {
 
         // Try to load vocab from various locations
         let vocab = crate::utils::load_vocab(&vocab_path)?;
-        println!("  LineRecognizer: {} chars in vocab", vocab.len());
+        println!(
+            "  LineRecognizer [{}]: {} chars in vocab",
+            model_name,
+            vocab.len()
+        );
+        // Debug: print output tensor info after creation
+        // (will be printed below after we read the output tensor shape)
 
         // Get output shape info and quantization params
         let (time_steps, vocab_size, output_idx, scale_val, zero_point) = {
             let mut options = Options::default();
-            options.is_xnnpack_enabled = true; // Enable XNNPACK
+            options.is_xnnpack_enabled = true;
             let interpreter = Interpreter::new(&model, Some(options))?;
             interpreter.allocate_tensors()?;
 
             let mut ts = 42usize;
-            let mut vs = 8179usize;
+            let mut vs = vocab.len() + 1; // default: vocab + blank
             let mut out_idx = 0usize;
             let mut sv = 1.0f32;
             let mut zp = 0i32;
@@ -84,7 +112,7 @@ impl LineRecognizer {
                 let tensor = interpreter.output(idx)?;
                 let shape = tensor.shape();
                 let dims = shape.dimensions();
-                if dims.len() == 3 && dims[2] > 1000 {
+                if dims.len() == 3 && dims[2] > vocab.len() {
                     ts = dims[1];
                     vs = dims[2];
                     out_idx = idx;
@@ -95,7 +123,66 @@ impl LineRecognizer {
                     break;
                 }
             }
+            // Debug: print input tensor info
+            let input_count = interpreter.input_tensor_count();
+            println!("  [{}] Input tensors: {}", model_name, input_count);
+            for idx in 0..input_count {
+                let tensor = interpreter.input(idx)?;
+                let shape = tensor.shape();
+                let dims = shape.dimensions();
+                let quant_info = if let Some(q) = tensor.quantization_parameters() {
+                    format!("scale={}, zero_point={}", q.scale, q.zero_point)
+                } else {
+                    "none".to_string()
+                };
+                println!(
+                    "    input[{}]: shape={:?} type={:?} quant=[{}]",
+                    idx,
+                    dims,
+                    tensor.data_type(),
+                    quant_info
+                );
+            }
+            // Also print all output tensors
+            let output_count = interpreter.output_tensor_count();
+            println!("  [{}] Output tensors: {}", model_name, output_count);
+            for idx in 0..output_count {
+                let tensor = interpreter.output(idx)?;
+                let shape = tensor.shape();
+                let dims = shape.dimensions();
+                let quant_info = if let Some(q) = tensor.quantization_parameters() {
+                    format!("scale={}, zero_point={}", q.scale, q.zero_point)
+                } else {
+                    "none".to_string()
+                };
+                println!(
+                    "    output[{}]: shape={:?} type={:?} quant=[{}]",
+                    idx,
+                    dims,
+                    tensor.data_type(),
+                    quant_info
+                );
+            }
+
             (ts, vs, out_idx, sv, zp)
+        };
+
+        // Blank token is at vocab_size - 1 (last index)
+        // For hanijpan: vocab=8178, vocab_size=8179, blank_idx=8178
+        // For und: vocab=1292, vocab_size=1293, blank_idx=1292
+        let blank_idx = vocab_size - 1;
+
+        println!(
+            "  [{}] Output: time_steps={}, vocab_size={}, blank_idx={}, scale={}, zero_point={}",
+            model_name, time_steps, vocab_size, blank_idx, scale_val, zero_point
+        );
+
+        // LEFT_MARGIN from Chrome config protobuf:
+        // hanijpan: 12 (from IDA analysis, assertion: left_padding % frame_width == 0)
+        // gocr_mobile_und: 8 (from gocr_mobile_und_config.pb: field 1 varint 8)
+        let left_margin = match model_name {
+            "gocr_mobile_und" => 8,
+            _ => LEFT_MARGIN, // 12 for hanijpan and others
         };
 
         Ok(Self {
@@ -103,19 +190,43 @@ impl LineRecognizer {
             vocab,
             time_steps,
             vocab_size,
+            blank_idx,
             output_idx,
             scale_val,
             zero_point,
+            left_margin,
+            model_name: model_name.to_string(),
         })
+    }
+
+    /// Create the default CJK (hanijpan) recognizer
+    pub fn new(model_dir: &Path) -> Result<Self> {
+        Self::new_with_model(model_dir, "hanijpan")
+    }
+
+    /// Effective width for content (MODEL_WIDTH - left_margin)
+    fn effective_width(&self) -> u32 {
+        MODEL_WIDTH - self.left_margin
+    }
+
+    /// Canvas fill (padding) value
+    /// Chrome uses memset(0) for tensor initialization (ConvertPixaToTensors at 0x1802AB450)
+    /// Both byte and float paths zero-fill the tensor before copying image data.
+    fn canvas_fill(&self) -> Luma<u8> {
+        Luma([0u8])
     }
 
     /// Create a new interpreter for batch processing
     pub fn create_interpreter(&self) -> Result<Interpreter> {
         let mut options = Options::default();
         options.thread_count = 4; // Use 4 threads
-        options.is_xnnpack_enabled = true; // Enable XNNPACK acceleration
+                                  // Try without XNNPACK if env var set, to test if it causes issues
+        if std::env::var("CHROME_OCR_NO_XNNPACK").is_err() {
+            options.is_xnnpack_enabled = true;
+        }
         let interpreter = Interpreter::new(&self.model, Some(options))?;
         interpreter.allocate_tensors()?;
+
         Ok(interpreter)
     }
 
@@ -138,7 +249,7 @@ impl LineRecognizer {
         // Calculate ideal width when scaled to height 32
         let ideal_w = (w as f32 * MODEL_HEIGHT as f32 / h as f32) as u32;
 
-        if ideal_w <= EFFECTIVE_WIDTH {
+        if ideal_w <= self.effective_width() {
             // Short line: direct recognition
             self.recognize_segment_with_interpreter(image, interpreter)
         } else {
@@ -148,7 +259,7 @@ impl LineRecognizer {
             // - MergeChunkResults: direct copy using chunk_lengths array
             // - Key insight: Chrome tracks exact pixel boundaries, not just ratios
 
-            let chunk_w = (EFFECTIVE_WIDTH as f32 * h as f32 / MODEL_HEIGHT as f32) as u32;
+            let chunk_w = (self.effective_width() as f32 * h as f32 / MODEL_HEIGHT as f32) as u32;
 
             // Chrome uses 30% border on each side, so step = 40% of chunk_width
             let step = (chunk_w as f32 * 0.4).max(1.0) as u32; // 40% step = 60% overlap
@@ -182,7 +293,11 @@ impl LineRecognizer {
             }
 
             if chunks.len() == 1 {
-                let (text, avg_conf) = self.ctc_decode_logits(&chunks[0].logits);
+                let (text, avg_conf) = if self.uses_beam_search() {
+                    self.ctc_beam_search(&chunks[0].logits)
+                } else {
+                    self.ctc_decode_logits(&chunks[0].logits)
+                };
                 return Ok((text, avg_conf));
             }
 
@@ -191,7 +306,11 @@ impl LineRecognizer {
             let merged_logits = self.merge_chunk_logits_by_boundary(&chunks, w);
 
             // Unified CTC decode on merged logits
-            let (text, avg_conf) = self.ctc_decode_logits(&merged_logits);
+            let (text, avg_conf) = if self.uses_beam_search() {
+                self.ctc_beam_search(&merged_logits)
+            } else {
+                self.ctc_decode_logits(&merged_logits)
+            };
 
             Ok((text, avg_conf))
         }
@@ -215,23 +334,32 @@ impl LineRecognizer {
 
         // Scale to height 32
         let scale = MODEL_HEIGHT as f32 / h as f32;
-        let new_w = ((w as f32 * scale) as u32).min(MODEL_WIDTH - LEFT_MARGIN);
+        let new_w = ((w as f32 * scale) as u32).min(MODEL_WIDTH - self.left_margin);
 
         let scaled = image::imageops::resize(
             image,
             new_w,
             MODEL_HEIGHT,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::Triangle, // Chrome uses Leptonica bilinear scaling (pixScale at 0x18078E140)
         );
 
         // Create canvas with left margin for model alignment
-        // Note: Chrome does NOT invert images - uses original grayscale values
+        // Chrome uses memset(0) for tensor initialization (ConvertPixaToTensors at 0x1802AB450)
+        // Padding is ZERO (black), NOT 255 (white)
         let mut canvas: GrayImage =
-            ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, Luma([255u8]));
-        image::imageops::overlay(&mut canvas, &scaled, LEFT_MARGIN as i64, 0);
+            ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, self.canvas_fill());
+        image::imageops::overlay(&mut canvas, &scaled, self.left_margin as i64, 0);
 
         // Run inference
-        let input_data: Vec<u8> = canvas.as_raw().to_vec();
+        let mut input_data: Vec<u8> = canvas.as_raw().to_vec();
+
+        // Debug: optionally invert pixels to test if model expects different orientation
+        if std::env::var("CHROME_OCR_INVERT").is_ok() {
+            for px in input_data.iter_mut() {
+                *px = 255 - *px;
+            }
+        }
+
         let input_tensor = interpreter.input(0)?;
         input_tensor.set_data(&input_data)?;
         interpreter.invoke()?;
@@ -240,12 +368,57 @@ impl LineRecognizer {
         let output_tensor = interpreter.output(self.output_idx)?;
         let logits_raw: &[u8] = output_tensor.data();
 
+        // Debug: dump first invocation's input and output for comparison
+        if std::env::var("CHROME_OCR_DUMP").is_ok() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static DUMP_COUNT: AtomicUsize = AtomicUsize::new(0);
+            let count = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count == 0 {
+                let dump_dir = std::path::Path::new("dump_debug");
+                std::fs::create_dir_all(dump_dir).ok();
+                std::fs::write(dump_dir.join("input_canvas.bin"), &input_data).ok();
+                std::fs::write(dump_dir.join("output_raw.bin"), logits_raw).ok();
+                eprintln!(
+                    "[DUMP] Saved input ({} bytes) and output ({} bytes) to dump_debug/",
+                    input_data.len(),
+                    logits_raw.len()
+                );
+                eprintln!(
+                    "[DUMP] Model: {}, output_idx: {}",
+                    self.model_name, self.output_idx
+                );
+                eprintln!(
+                    "[DUMP] Raw output range: [{}, {}]",
+                    logits_raw.iter().cloned().min().unwrap_or(0),
+                    logits_raw.iter().cloned().max().unwrap_or(0)
+                );
+                eprintln!(
+                    "[DUMP] Values at 255: {}",
+                    logits_raw.iter().filter(|&&x| x == 255).count()
+                );
+            }
+        }
+
+        // Calculate content-based time step range to avoid decoding padding
+        let pixels_per_step = MODEL_WIDTH as f32 / self.time_steps as f32;
+        let content_start_t = (self.left_margin as f32 / pixels_per_step).floor() as usize;
+        let content_end_pixel = self.left_margin + new_w;
+        let content_end_t =
+            ((content_end_pixel as f32 / pixels_per_step).ceil() as usize + 1).min(self.time_steps);
+
         let mut logits = vec![0.0f32; self.time_steps * self.vocab_size];
         for t in 0..self.time_steps {
             let base = t * self.vocab_size;
-            for i in 0..self.vocab_size {
-                let raw = logits_raw[base + i] as i32;
-                logits[base + i] = (raw - self.zero_point) as f32 * self.scale_val;
+            if t >= content_start_t && t < content_end_t {
+                for i in 0..self.vocab_size {
+                    let raw = logits_raw[base + i] as i32;
+                    logits[base + i] = (raw - self.zero_point) as f32 * self.scale_val;
+                }
+            } else {
+                // Force blank for padding region time steps
+                for i in 0..self.vocab_size {
+                    logits[base + i] = if i == self.blank_idx { 10.0 } else { -10.0 };
+                }
             }
         }
 
@@ -425,9 +598,10 @@ impl LineRecognizer {
             }
             let char_conf = 1.0 / exp_sum;
 
-            // CTC decoding: skip blank, repeated, and low-confidence
-            if max_idx != 0 && max_idx != BLANK_IDX && Some(max_idx) != prev_idx {
-                if char_conf >= CHAR_CONF_THRESHOLD && max_idx < self.vocab.len() {
+            // CTC decoding: skip blank and repeated
+            // Index 0 is space ' ' in UND model — NOT blank. Blank = vocab_size-1.
+            if max_idx != self.blank_idx && Some(max_idx) != prev_idx {
+                if char_conf >= self.char_conf_threshold() && max_idx < self.vocab.len() {
                     let c = &self.vocab[max_idx];
                     if !c.is_empty() {
                         chars.push((c.clone(), char_conf));
@@ -449,6 +623,185 @@ impl LineRecognizer {
 
         let result: String = cleaned.into_iter().map(|(s, _)| s).collect();
         (result, avg_conf)
+    }
+
+    /// CTC prefix beam search decoder (from IDA: CTCDecoder::Decode at 0x18058AFD0)
+    /// NOTE: Chrome's UND config has use_beam_search=false. This is kept for reference
+    /// but not used in the normal code path.
+    #[allow(dead_code)]
+    fn ctc_beam_search(&self, logits: &[f32]) -> (String, f32) {
+        const BEAM_WIDTH: usize = 25;
+        const BEAM_CHAR_THRESHOLD: f32 = 0.001;
+        if logits.is_empty() {
+            return (String::new(), 0.0);
+        }
+
+        let total_frames = logits.len() / self.vocab_size;
+
+        // Each beam: (prefix as Vec<usize>, p_blank in log, p_non_blank in log)
+        // Use log probabilities to avoid underflow
+        let neg_inf = f64::NEG_INFINITY;
+
+        // Initialize with empty prefix
+        // key: prefix (as character indices), value: (log_p_blank, log_p_non_blank)
+        let mut beams: HashMap<Vec<usize>, (f64, f64)> = HashMap::new();
+        beams.insert(Vec::new(), (0.0, neg_inf)); // empty prefix, p_blank=1.0 (log=0)
+
+        for t in 0..total_frames {
+            let base = t * self.vocab_size;
+
+            // Compute log softmax for this timestep
+            let mut max_logit = f32::NEG_INFINITY;
+            for i in 0..self.vocab_size {
+                let val = logits[base + i];
+                if val > max_logit {
+                    max_logit = val;
+                }
+            }
+
+            let mut log_probs = vec![0.0f64; self.vocab_size];
+            let mut exp_sum = 0.0f64;
+            for i in 0..self.vocab_size {
+                let e = ((logits[base + i] - max_logit) as f64).exp();
+                exp_sum += e;
+            }
+            let log_sum = exp_sum.ln();
+            for i in 0..self.vocab_size {
+                log_probs[i] = (logits[base + i] - max_logit) as f64 - log_sum;
+            }
+
+            let log_p_blank = log_probs[self.blank_idx];
+
+            // Find top-K characters by probability for efficiency
+            // Instead of extending with all 1293 chars, only use top ones
+            let mut char_indices: Vec<usize> = (0..self.vocab_size)
+                .filter(|&i| {
+                    i != self.blank_idx && log_probs[i] > (BEAM_CHAR_THRESHOLD as f64).ln()
+                })
+                .collect();
+            char_indices.sort_by(|&a, &b| {
+                log_probs[b]
+                    .partial_cmp(&log_probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // Limit to top chars to avoid explosion
+            char_indices.truncate(40);
+
+            let mut new_beams: HashMap<Vec<usize>, (f64, f64)> = HashMap::new();
+
+            for (prefix, (pb, pnb)) in &beams {
+                let p_total = log_add(*pb, *pnb);
+
+                // 1. Extend with blank → same prefix
+                let new_pb = p_total + log_p_blank;
+                let entry = new_beams
+                    .entry(prefix.clone())
+                    .or_insert((neg_inf, neg_inf));
+                entry.0 = log_add(entry.0, new_pb);
+
+                // 2. Extend with each character
+                for &c in &char_indices {
+                    let log_p_c = log_probs[c];
+                    let last_char = prefix.last().copied();
+
+                    if Some(c) == last_char {
+                        // Same as last character in prefix:
+                        // - Via blank path: extends prefix (new character instance)
+                        // - Via non-blank path: stays same prefix (CTC repeat)
+                        let new_pnb_extend = *pb + log_p_c; // blank → c = new instance
+                        let new_pnb_repeat = *pnb + log_p_c; // c → c = CTC repeat (same prefix)
+
+                        // CTC repeat stays same prefix
+                        let entry = new_beams
+                            .entry(prefix.clone())
+                            .or_insert((neg_inf, neg_inf));
+                        entry.1 = log_add(entry.1, new_pnb_repeat);
+
+                        // Blank → c creates new instance (extended prefix)
+                        let mut extended = prefix.clone();
+                        extended.push(c);
+                        let entry = new_beams.entry(extended).or_insert((neg_inf, neg_inf));
+                        entry.1 = log_add(entry.1, new_pnb_extend);
+                    } else {
+                        // Different character: extend prefix
+                        let new_pnb = p_total + log_p_c;
+                        let mut extended = prefix.clone();
+                        extended.push(c);
+                        let entry = new_beams.entry(extended).or_insert((neg_inf, neg_inf));
+                        entry.1 = log_add(entry.1, new_pnb);
+                    }
+                }
+            }
+
+            // Prune to top BEAM_WIDTH beams by total log probability
+            let mut beam_vec: Vec<(Vec<usize>, (f64, f64))> = new_beams.into_iter().collect();
+            beam_vec.sort_by(|a, b| {
+                let total_a = log_add(a.1 .0, a.1 .1);
+                let total_b = log_add(b.1 .0, b.1 .1);
+                total_b
+                    .partial_cmp(&total_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            beam_vec.truncate(BEAM_WIDTH);
+
+            beams = beam_vec.into_iter().collect();
+        }
+
+        // Find best beam
+        let best = beams
+            .iter()
+            .max_by(|a, b| {
+                let total_a = log_add(a.1 .0, a.1 .1);
+                let total_b = log_add(b.1 .0, b.1 .1);
+                total_a
+                    .partial_cmp(&total_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(prefix, _)| prefix.clone())
+            .unwrap_or_default();
+
+        // Convert indices to string
+        let mut result = String::new();
+        let mut conf_sum = 0.0f32;
+        for &idx in &best {
+            if idx < self.vocab.len() {
+                result.push_str(&self.vocab[idx]);
+                conf_sum += 1.0; // beam search confidence is hard to compute per-char
+            }
+        }
+
+        let avg_conf = if best.is_empty() {
+            0.0
+        } else {
+            // Use the total beam probability as confidence proxy
+            let (pb, pnb) = beams.get(&best).copied().unwrap_or((neg_inf, neg_inf));
+            let total_log_prob = log_add(pb, pnb);
+            // Normalize by number of frames to get per-frame confidence
+            let per_frame = total_log_prob / total_frames as f64;
+            per_frame.exp() as f32
+        };
+
+        (result, avg_conf.max(0.01)) // minimum confidence so it passes filters
+    }
+
+    /// Get the character confidence threshold for this model
+    /// Chrome UND config: char_score_threshold=0 (no filtering)
+    /// CJK models: use 0.15 to filter noise
+    fn char_conf_threshold(&self) -> f32 {
+        if self.model_name == "gocr_mobile_und" {
+            UND_CHAR_CONF_THRESHOLD
+        } else {
+            CHAR_CONF_THRESHOLD
+        }
+    }
+
+    /// Check if this recognizer should use beam search
+    /// From IDA: Chrome uses CTC Beam Search via CTCDecoder::Decode (sub_18058AFD0)
+    /// with NegativeLogitsScore preprocessing
+    pub fn uses_beam_search(&self) -> bool {
+        // Chrome UND config has use_beam_search=false (greedy CTC decode)
+        // Only hanijpan uses beam search
+        self.model_name == "hanijpan"
     }
 
     /// Remove consecutive duplicate characters (Chrome's CJK merge behavior)
@@ -485,7 +838,21 @@ impl LineRecognizer {
         image: &GrayImage,
         interpreter: &Interpreter,
     ) -> Result<(String, f32)> {
-        self.recognize_segment_trimmed(image, interpreter, 0, self.time_steps)
+        // Calculate content-based time step range to avoid decoding padding
+        let (w, h) = (image.width(), image.height());
+        let scale = MODEL_HEIGHT as f32 / h as f32;
+        let new_w = ((w as f32 * scale) as u32).min(MODEL_WIDTH - self.left_margin);
+        // Content occupies pixels [left_margin, left_margin + new_w]
+        // Each time step = MODEL_WIDTH / time_steps pixels
+        let pixels_per_step = MODEL_WIDTH as f32 / self.time_steps as f32;
+        // Start: first time step that overlaps with content
+        let start_t =
+            ((self.left_margin as f32 / pixels_per_step).floor() as usize).min(self.time_steps);
+        // End: last time step that overlaps with content + 1 safety margin
+        let content_end_pixel = self.left_margin + new_w;
+        let end_t =
+            ((content_end_pixel as f32 / pixels_per_step).ceil() as usize + 1).min(self.time_steps);
+        self.recognize_segment_trimmed(image, interpreter, start_t, end_t)
     }
 
     /// Recognize a segment with time step trimming (Chrome's TrimOutputScores behavior)
@@ -500,13 +867,13 @@ impl LineRecognizer {
 
         // Scale to height 32
         let scale = MODEL_HEIGHT as f32 / h as f32;
-        let new_w = ((w as f32 * scale) as u32).min(MODEL_WIDTH - LEFT_MARGIN);
+        let new_w = ((w as f32 * scale) as u32).min(MODEL_WIDTH - self.left_margin);
 
         let scaled = image::imageops::resize(
             image,
             new_w,
             MODEL_HEIGHT,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::Triangle, // Chrome uses Leptonica bilinear scaling (pixScale at 0x18078E140)
         );
 
         // Debug: check average pixel values
@@ -524,10 +891,25 @@ impl LineRecognizer {
         }
 
         // Create canvas with left margin for model alignment
-        // Note: Chrome does NOT invert images - uses original grayscale values (from IDA analysis)
+        // Chrome uses memset(0) for tensor padding (ConvertPixaToTensors at 0x1802AB450)
         let mut canvas: GrayImage =
-            ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, Luma([255u8]));
-        image::imageops::overlay(&mut canvas, &scaled, LEFT_MARGIN as i64, 0);
+            ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, self.canvas_fill());
+        image::imageops::overlay(&mut canvas, &scaled, self.left_margin as i64, 0);
+
+        // Debug: save first few canvases
+        if std::env::var("CHROME_OCR_SAVE_CANVAS").is_ok() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                let fname = format!("debug_canvas_{}_{}.png", self.model_name, n);
+                canvas.save(&fname).ok();
+                eprintln!(
+                    "  [SAVE] {} ({}x{}, left_margin={})",
+                    fname, new_w, MODEL_HEIGHT, self.left_margin
+                );
+            }
+        }
 
         self.recognize_canvas_with_trim(&canvas, interpreter, start_t, end_t)
     }
@@ -545,20 +927,20 @@ impl LineRecognizer {
 
         // Scale to height 32
         let scale = MODEL_HEIGHT as f32 / h as f32;
-        let new_w = ((w as f32 * scale) as u32).min(MODEL_WIDTH - LEFT_MARGIN);
+        let new_w = ((w as f32 * scale) as u32).min(MODEL_WIDTH - self.left_margin);
 
         let scaled = image::imageops::resize(
             image,
             new_w,
             MODEL_HEIGHT,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::Triangle, // Chrome uses Leptonica bilinear scaling (pixScale at 0x18078E140)
         );
 
         // Create canvas with left margin for model alignment
-        // Note: Chrome does NOT invert images - uses original grayscale values (from IDA analysis)
+        // Chrome uses memset(0) for tensor padding (ConvertPixaToTensors at 0x1802AB450)
         let mut canvas: GrayImage =
-            ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, Luma([255u8]));
-        image::imageops::overlay(&mut canvas, &scaled, LEFT_MARGIN as i64, 0);
+            ImageBuffer::from_pixel(MODEL_WIDTH, MODEL_HEIGHT, self.canvas_fill());
+        image::imageops::overlay(&mut canvas, &scaled, self.left_margin as i64, 0);
 
         // Run inference
         let input_data: Vec<u8> = canvas.as_raw().to_vec();
@@ -615,9 +997,10 @@ impl LineRecognizer {
             }
             let char_conf = 1.0 / exp_sum;
 
-            // CTC decoding: skip blank, repeated, and low-confidence
-            if max_idx != 0 && max_idx != BLANK_IDX && Some(max_idx) != prev_idx {
-                if char_conf >= CHAR_CONF_THRESHOLD && max_idx < self.vocab.len() {
+            // CTC decoding: skip blank and repeated
+            // Index 0 is space ' ' in UND model — NOT blank. Blank = vocab_size-1.
+            if max_idx != self.blank_idx && Some(max_idx) != prev_idx {
+                if char_conf >= self.char_conf_threshold() && max_idx < self.vocab.len() {
                     let c = &self.vocab[max_idx];
                     if !c.is_empty() {
                         // Calculate character position in original image coordinates
@@ -627,10 +1010,10 @@ impl LineRecognizer {
                         let canvas_x1 = (t + 1) as f32 * FRAME_WIDTH as f32;
 
                         // Convert to content-relative (subtract LEFT_MARGIN, clamp to content bounds)
-                        let content_x0 = (canvas_x0 - LEFT_MARGIN as f32)
+                        let content_x0 = (canvas_x0 - self.left_margin as f32)
                             .max(0.0)
                             .min(content_pixels);
-                        let content_x1 = (canvas_x1 - LEFT_MARGIN as f32)
+                        let content_x1 = (canvas_x1 - self.left_margin as f32)
                             .max(0.0)
                             .min(content_pixels);
 
@@ -1024,7 +1407,14 @@ impl LineRecognizer {
         end_t: usize,
     ) -> Result<(String, f32)> {
         // Prepare input data [1, 32, 168, 1]
-        let input_data: Vec<u8> = canvas.as_raw().to_vec();
+        let mut input_data: Vec<u8> = canvas.as_raw().to_vec();
+
+        // Debug: optionally invert pixels
+        if std::env::var("CHROME_OCR_INVERT").is_ok() {
+            for px in input_data.iter_mut() {
+                *px = 255 - *px;
+            }
+        }
 
         // Set input tensor
         let input_tensor = interpreter.input(0)?;
@@ -1038,68 +1428,61 @@ impl LineRecognizer {
         let logits_raw: &[u8] = output_tensor.data();
 
         // Dequantize logits using cached params
-        let mut logits = vec![0.0f32; self.time_steps * self.vocab_size];
-        for t in 0..self.time_steps {
-            let base = t * self.vocab_size;
-            for i in 0..self.vocab_size {
-                let raw = logits_raw[base + i] as i32;
-                logits[base + i] = (raw - self.zero_point) as f32 * self.scale_val;
-            }
-        }
-
-        // Decode using CTC greedy decoding with softmax confidence
-        // Only decode from start_t to end_t (Chrome's TrimOutputScores behavior)
-        let mut result = String::new();
-        let mut prev_idx: Option<usize> = None;
-        let mut conf_scores = Vec::new();
-
+        // Extract only the valid time steps (start_t to end_t)
         let actual_end = end_t.min(self.time_steps);
+        let trimmed_frames = actual_end - start_t;
+        let mut logits = vec![0.0f32; trimmed_frames * self.vocab_size];
         for t in start_t..actual_end {
-            let base = t * self.vocab_size;
-
-            // Find max logit and compute softmax
-            let mut max_idx = 0usize;
-            let mut max_logit = f32::NEG_INFINITY;
-            let mut max_for_softmax = f32::NEG_INFINITY;
-
+            let src_base = t * self.vocab_size;
+            let dst_base = (t - start_t) * self.vocab_size;
             for i in 0..self.vocab_size {
-                let val = logits[base + i];
-                if val > max_logit {
-                    max_logit = val;
-                    max_idx = i;
-                }
-                if val > max_for_softmax {
-                    max_for_softmax = val;
-                }
+                let raw = logits_raw[src_base + i] as i32;
+                logits[dst_base + i] = (raw - self.zero_point) as f32 * self.scale_val;
             }
-
-            // Compute softmax for max element
-            let mut exp_sum = 0.0f32;
-            for i in 0..self.vocab_size {
-                exp_sum += (logits[base + i] - max_for_softmax).exp();
-            }
-            let char_conf = 1.0 / exp_sum; // softmax(max_logit) = exp(0) / sum = 1 / sum
-
-            // CTC decoding: skip index 0, blank (8178), repeated, and low-confidence
-            if max_idx != 0 && max_idx != BLANK_IDX && Some(max_idx) != prev_idx {
-                if char_conf >= CHAR_CONF_THRESHOLD && max_idx < self.vocab.len() {
-                    let c = &self.vocab[max_idx];
-                    if !c.is_empty() {
-                        result.push_str(c);
-                        conf_scores.push(char_conf);
-                    }
-                }
-            }
-            prev_idx = Some(max_idx);
         }
 
-        let avg_conf = if conf_scores.is_empty() {
-            0.0
-        } else {
-            conf_scores.iter().sum::<f32>() / conf_scores.len() as f32
-        };
+        // Debug: dump top predictions per timestep for the first few calls
+        if std::env::var("CHROME_OCR_DUMP_LOGITS").is_ok() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static DUMP_CTR: AtomicUsize = AtomicUsize::new(0);
+            let dump_n = DUMP_CTR.fetch_add(1, Ordering::Relaxed);
+            if dump_n < 3 {
+                eprintln!(
+                    "  [DUMP] Logits for call #{}, frames={}",
+                    dump_n, trimmed_frames
+                );
+                for t in 0..trimmed_frames.min(10) {
+                    let base = t * self.vocab_size;
+                    let mut top3: Vec<(usize, f32)> = (0..self.vocab_size)
+                        .map(|i| (i, logits[base + i]))
+                        .collect();
+                    top3.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    let top3_str: Vec<String> = top3[..3.min(top3.len())]
+                        .iter()
+                        .map(|(idx, val)| {
+                            let ch = if *idx == self.blank_idx {
+                                "<BLK>".to_string()
+                            } else if *idx < self.vocab.len() {
+                                self.vocab[*idx].clone()
+                            } else {
+                                format!("?{}", idx)
+                            };
+                            format!("{}({:.2})", ch, val)
+                        })
+                        .collect();
+                    eprintln!("    t={}: {}", t, top3_str.join(" | "));
+                }
+            }
+        }
 
-        Ok((result, avg_conf))
+        // Decode using beam search or greedy based on model type
+        if self.uses_beam_search() {
+            let (text, conf) = self.ctc_beam_search(&logits);
+            Ok((text, conf))
+        } else {
+            let (text, conf) = self.ctc_decode_logits(&logits);
+            Ok((text, conf))
+        }
     }
 
     /// Merge overlapping text segments with fuzzy matching
@@ -1434,4 +1817,17 @@ impl LineRecognizer {
 
         0
     }
+}
+
+/// Log-space addition: log(exp(a) + exp(b))
+/// Numerically stable implementation
+fn log_add(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        return b;
+    }
+    if b == f64::NEG_INFINITY {
+        return a;
+    }
+    let max = a.max(b);
+    max + ((a - max).exp() + (b - max).exp()).ln()
 }

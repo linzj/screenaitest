@@ -161,7 +161,10 @@ impl TextDetector {
         let mut channel_stats: Vec<(f32, f32)> = vec![(f32::MAX, f32::MIN); 7];
         let mut high_conf_count = 0;
 
-        // Track anchor index for each valid output
+        // Chrome config has 6 anchors matching 6 outputs from one FPN pass.
+        // The model produces 11 outputs total (two FPN passes), but only the first 6
+        // have corresponding anchors. Outputs 6-10 are the second pass and would need
+        // separate anchor assignment; we skip them to avoid over-merging.
         let mut anchor_idx = 0usize;
 
         for output_idx in 0..output_count {
@@ -170,17 +173,28 @@ impl TextDetector {
             let dims = shape.dimensions();
 
             if dims.len() == 4 && dims[3] == 7 {
+                // Only process outputs that have corresponding anchors
+                if anchor_idx >= ANCHOR_WIDTHS.len() {
+                    break;
+                }
+
                 let feat_h = dims[1];
                 let feat_w = dims[2];
 
                 // Calculate stride (subsampling factor)
                 let stride = TARGET_SIZE as f32 / feat_h as f32;
 
-                // Get anchor values for this output scale
-                // Anchor index wraps around if we have more outputs than anchors
-                let anchor_w = ANCHOR_WIDTHS[anchor_idx % ANCHOR_WIDTHS.len()];
-                let anchor_h = ANCHOR_HEIGHTS[anchor_idx % ANCHOR_HEIGHTS.len()];
+                // Get anchor values for this output scale from config
+                let anchor_w = ANCHOR_WIDTHS[anchor_idx];
+                let anchor_h = ANCHOR_HEIGHTS[anchor_idx];
                 anchor_idx += 1;
+
+                if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                    println!(
+                        "  Output[{}]: {}x{} stride={:.1} anchor=({:.0},{:.0})",
+                        output_idx, feat_h, feat_w, stride, anchor_w, anchor_h
+                    );
+                }
 
                 // Skip very coarse feature maps (stride > 200)
                 if stride > 200.0 {
@@ -226,11 +240,12 @@ impl TextDetector {
                             let cy = (y as f32 + 0.5 + dy) * stride;
 
                             // Calculate box size
-                            // IDA analysis shows: width = exp(log_delta) * anchor * stride / scale_factor
-                            // Anchor values [16, 64] are base sizes, stride normalizes to feature map scale
-                            // Using stride directly as scale factor (anchor * stride / 64 ≈ stride for anchor=64)
-                            let bw = (log_w.exp() * stride).clamp(8.0, 512.0);
-                            let bh = (log_h.exp() * stride).clamp(8.0, 256.0);
+                            // Chrome config: width = exp(clamp(log_w, -4, 4)) * anchor_w
+                            // anchor values per output scale from config binarypb
+                            let log_w_clamped = log_w.clamp(-4.0, 4.0);
+                            let log_h_clamped = log_h.clamp(-4.0, 4.0);
+                            let bw = log_w_clamped.exp() * anchor_w;
+                            let bh = log_h_clamped.exp() * anchor_h;
 
                             // Calculate rotation angle from cos/sin
                             let angle = rot_sin.atan2(rot_cos);
@@ -300,9 +315,10 @@ impl TextDetector {
 
         let mut kept = Vec::new();
         for bbox in boxes {
+            // Chrome config: detection NMS IoU threshold = 0.5
             let dominated = kept
                 .iter()
-                .any(|k: &BBox| crate::utils::calc_iou(&bbox.as_array(), &k.as_array()) > 0.3);
+                .any(|k: &BBox| crate::utils::calc_iou(&bbox.as_array(), &k.as_array()) > 0.5);
             if !dominated {
                 kept.push(bbox);
             }

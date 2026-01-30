@@ -88,19 +88,26 @@ fn find_bundled_model_dir() -> Option<PathBuf> {
 /// Load vocabulary from JSON char map file
 /// The file should be a JSON object with numeric keys (as strings) and character values
 pub fn load_vocab(path: &std::path::Path) -> Result<Vec<String>> {
-    // Try JSON format first (hanijpan_char_map.json)
+    // Try the exact path first (with .json extension)
     let json_path = path.with_extension("json");
     let json_path = if json_path.exists() {
         json_path
+    } else if path.exists() {
+        path.to_path_buf()
     } else {
-        // Also check in the same directory with a different name
-        path.parent()
-            .map(|p| p.join("hanijpan_char_map.json"))
-            .filter(|p| p.exists())
-            .unwrap_or_else(|| {
-                // Check in current directory
-                std::path::PathBuf::from("hanijpan_char_map.json")
-            })
+        // Fallback: try hanijpan_char_map.json only if the requested file
+        // itself is hanijpan (avoid loading wrong vocab for other models)
+        let filename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if filename.starts_with("hanijpan") {
+            let fallback = path
+                .parent()
+                .map(|p| p.join("hanijpan_char_map.json"))
+                .filter(|p| p.exists())
+                .unwrap_or_else(|| std::path::PathBuf::from("hanijpan_char_map.json"));
+            fallback
+        } else {
+            return Err(anyhow!("Vocab file not found: {}", path.display()));
+        }
     };
 
     if json_path.exists() {
@@ -186,6 +193,37 @@ pub fn calc_xy_overlap(b1: &[f32; 4], b2: &[f32; 4]) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Chrome's ComputeCommonCharacters (sub_1804660F0):
+/// Computes common character percentage using frequency matching (not positional).
+/// Returns fraction of text_b's chars that are also in text_a.
+pub fn calc_common_chars_pct(text_a: &str, text_b: &str) -> f32 {
+    if text_a == text_b {
+        return 1.0;
+    }
+    let len_b = text_b.chars().count();
+    if len_b == 0 {
+        return 0.0;
+    }
+
+    // Build char frequency map from text_b
+    let mut freq: std::collections::HashMap<char, i32> = std::collections::HashMap::new();
+    for c in text_b.chars() {
+        *freq.entry(c).or_insert(0) += 1;
+    }
+
+    // Subtract chars found in text_a
+    for c in text_a.chars() {
+        if let Some(count) = freq.get_mut(&c) {
+            *count -= 1;
+        }
+    }
+
+    // Count remaining (uncommon) chars
+    let uncommon: i32 = freq.values().filter(|&&v| v > 0).sum();
+    let denominator = len_b.max(2) as f32;
+    1.0 - uncommon as f32 / denominator
 }
 
 #[derive(Clone, Debug)]

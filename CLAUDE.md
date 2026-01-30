@@ -1,4 +1,7 @@
 必须使用ida-pro-mcp 逆向，参考真正的解决方案
 所做的任何修改必须从逆向得到印证
+所作的任何尝试必须记录完整的过程和结果 避免反复重试
 必须记录逆向出来的方案结果到current.md
-直到和native的版本输出一样，不能停下来，不断逆向 hot_path.md 的调用路径得到解决方案
+直到和native的版本输出一样，不能停下来，不断逆向 hot_path_ppt.md hot_path_layout_test.md 等图片对应的调用路径得到解决方案
+用task tool 反汇编得出结果，避免直接mcp调用导致context window急速耗尽, 结果应当记录到文档避免多次重复进行反汇编
+build 不要release包

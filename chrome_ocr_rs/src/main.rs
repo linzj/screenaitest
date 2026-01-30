@@ -32,8 +32,8 @@ struct Args {
     #[arg(long)]
     model_dir: Option<PathBuf>,
 
-    /// Minimum confidence threshold
-    #[arg(long, default_value = "0.7")]
+    /// Minimum confidence threshold (Chrome uses per-char junk filter, not line-level)
+    #[arg(long, default_value = "0.0")]
     min_conf: f32,
 
     /// Use native chrome_screen_ai.dll instead of TFLite

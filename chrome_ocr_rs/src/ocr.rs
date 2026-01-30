@@ -9,9 +9,9 @@ use crate::cluster_sort::ClusterSort;
 use crate::detector::TextDetector;
 use crate::recognizer::LineRecognizer;
 use crate::sorter::LayoutSorter;
-use crate::utils::{calc_containment, calc_iou, BBox};
+use crate::utils::{calc_common_chars_pct, calc_containment, calc_iou, BBox};
 
-const MIN_HEIGHT: u32 = 40;
+const MIN_HEIGHT: u32 = 20; // Reduced: model only needs 32px input height, 40px caused cross-line merging
 const TARGET_SIZE: u32 = 4096;
 
 #[derive(Default)]
@@ -30,6 +30,7 @@ pub struct PerfStats {
 pub struct ChromeOCR {
     detector: TextDetector,
     recognizer: LineRecognizer,
+    recognizer_und: Option<LineRecognizer>, // Universal (Latin) recognizer
     sorter: LayoutSorter,
     cluster_sort: ClusterSort,
     save_lines: bool,
@@ -59,6 +60,18 @@ impl ChromeOCR {
         stats.load_recognizer = t2.elapsed().as_secs_f64();
         println!("  LineRecognizer: loaded");
 
+        // Try to load universal (Latin/und) recognizer
+        let recognizer_und = match LineRecognizer::new_with_model(model_dir, "gocr_mobile_und") {
+            Ok(r) => {
+                println!("  LineRecognizer [und]: loaded");
+                Some(r)
+            }
+            Err(e) => {
+                println!("  LineRecognizer [und]: not available ({})", e);
+                None
+            }
+        };
+
         let cluster_sort = ClusterSort::new(model_dir)?;
         println!("  ClusterSort: loaded");
 
@@ -67,10 +80,11 @@ impl ChromeOCR {
         Ok(Self {
             detector,
             recognizer,
+            recognizer_und,
             sorter,
             cluster_sort,
             save_lines: false,
-            min_conf: 0.7,
+            min_conf: 0.0, // Chrome doesn't filter by overall line confidence; uses per-char junk filter instead
             perf,
             stats,
         })
@@ -208,8 +222,12 @@ impl ChromeOCR {
         let rec_start = Instant::now();
         let mut rec_count = 0usize;
 
-        // Create interpreter once for all recognitions
+        // Create interpreters once for all recognitions
         let rec_interpreter = self.recognizer.create_interpreter()?;
+        let rec_interpreter_und = match &self.recognizer_und {
+            Some(r) => Some(r.create_interpreter()?),
+            None => None,
+        };
 
         for bbox in &sorted_lines {
             // Convert 4096 coordinates to original image coordinates
@@ -218,25 +236,35 @@ impl ChromeOCR {
             let mut x2 = ((bbox.x2 - offset_x) / scale) as i32;
             let mut y2 = ((bbox.y2 - offset_y) / scale) as i32;
 
-            // Chrome pads boxes before recognition: clamp(height * scale_factor, 4.0, 16.0)
-            // From IDA analysis of sub_18048ACD0 (region_proposal_text_detector.cc)
-            // Since our char-level grouping may miss edge chars, use box_height/3
-            // as padding (approximately one char width) to compensate
-            let box_h = (y2 - y1) as f32;
-            let pad_x = (box_h / 3.0).clamp(10.0, 40.0) as i32;
-            let pad_y = (box_h / 6.0).clamp(4.0, 16.0) as i32;
+            // Chrome padding from IDA analysis of sub_18048ACD0 (PadAndScaleBoxes):
+            // Width: max(4.0, min(16.0, box_h_4096 * box_width_padding)) in 4096-space
+            // Config box_width_padding=0.0 (default, not overridden in gocr config)
+            // So effective padding = 4.0 in 4096-space, split 50/50 left/right
+            // Height: max(1.0, min(8.0, box_h_4096 * factor)) = 1.0 in 4096-space
+            let box_h_4096 = bbox.y2 - bbox.y1;
+            let pad_x_4096 = (box_h_4096 * 0.0_f32).clamp(4.0, 16.0); // = 4.0
+            let pad_y_4096 = (box_h_4096 * 0.0_f32).clamp(1.0, 8.0); // = 1.0
+            let pad_x = (pad_x_4096 / scale) as i32;
+            let pad_y = (pad_y_4096 / scale) as i32;
             x1 = (x1 - pad_x).max(0);
             y1 = (y1 - pad_y).max(0);
             x2 = (x2 + pad_x).min(width as i32);
             y2 = (y2 + pad_y).min(height as i32);
 
-            if x2 - x1 < 10 || y2 - y1 < 5 {
+            let box_w = (x2 - x1) as f32;
+            let box_h = (y2 - y1) as f32;
+
+            // Filter minimum box dimensions
+            if box_w < 3.0 || box_h < 3.0 {
                 continue;
             }
 
-            // Expand short lines
+            // Expand short lines - but only if wide enough (not small table cells)
+            // For small boxes (both dimensions small), the recognizer scales to 32 height
+            // which handles them fine. Expanding Y adds blank context that makes the text
+            // proportionally tiny.
             let line_height = (y2 - y1) as u32;
-            if line_height < MIN_HEIGHT {
+            if line_height < MIN_HEIGHT && box_w > 40.0 {
                 let expand = ((MIN_HEIGHT - line_height) / 2 + 3) as i32;
                 y1 = (y1 - expand).max(0);
                 y2 = (y2 + expand).min(height as i32);
@@ -356,8 +384,8 @@ impl ChromeOCR {
                 let mut sub_h = sub_region.height();
                 let sub_w = sub_region.width();
 
-                // Expand short sub-regions
-                let sub_region = if sub_h < MIN_HEIGHT {
+                // Expand short sub-regions (only if wide enough)
+                let sub_region = if sub_h < MIN_HEIGHT && sub_w > 40 {
                     let expand_sub = ((MIN_HEIGHT - sub_h) / 2 + 3) as i32;
                     let new_y1 = (actual_y - expand_sub).max(0);
                     let new_y2 = (actual_y + sub_h as i32 + expand_sub).min(height as i32);
@@ -377,7 +405,9 @@ impl ChromeOCR {
                 };
 
                 // Check for duplicates using Chrome's RemoveOverlaps parameters from IDA:
-                // line_overlap_iou_threshold = 0.6, minimum_breadth_ratio = 0.6
+                // RemoveOverlapsWordPruningStep: line_overlap_iou_threshold = 0.6
+                // RemoveMultiByOverlap: overlap_threshold = 0.6, max_breadth_ratio = 2
+                // Chrome requires breadth ratio similarity before removing contained boxes
                 let is_duplicate =
                     recognized_lines
                         .iter()
@@ -395,35 +425,38 @@ impl ChromeOCR {
                                 (prev_y as u32 + prev_h) as f32,
                             ];
 
+                            let w1 = b1[2] - b1[0];
+                            let w2 = b2[2] - b2[0];
+                            let breadth_ratio = if w1.max(w2) > 0.0 {
+                                w1.min(w2) / w1.max(w2)
+                            } else {
+                                0.0
+                            };
+
                             // Calculate IoU (Chrome: line_overlap_iou_threshold = 0.6)
                             let iou = calc_iou(&b1, &b2);
                             if iou > 0.6 {
                                 return true;
                             }
 
-                            // Calculate containment
+                            // Calculate containment (Chrome: overlap_threshold = 0.6)
+                            // Chrome only removes contained boxes when breadth ratio >= 0.5
+                            // (max_breadth_ratio = 2 means min ratio = 1/2 = 0.5)
                             let containment1 = calc_containment(&b1, &b2);
                             let containment2 = calc_containment(&b2, &b1);
-                            if containment1 > 0.6 || containment2 > 0.6 {
+                            if (containment1 > 0.6 || containment2 > 0.6) && breadth_ratio > 0.5 {
                                 return true;
                             }
 
-                            // Check breadth ratio (Chrome: minimum_breadth_ratio = 0.6)
-                            let w1 = b1[2] - b1[0];
-                            let w2 = b2[2] - b2[0];
-                            let breadth_ratio = w1.min(w2) / w1.max(w2);
-
-                            // Only compare if similar width (same line type)
-                            if breadth_ratio < 0.6 {
+                            // Check vertical + horizontal overlap for same-row detection
+                            if breadth_ratio < 0.5 {
                                 return false;
                             }
 
-                            // Check vertical overlap
                             let y_overlap = (b1[3].min(b2[3]) - b1[1].max(b2[1])).max(0.0);
                             let min_h = (b1[3] - b1[1]).min(b2[3] - b2[1]);
                             let y_overlap_ratio = if min_h > 0.0 { y_overlap / min_h } else { 0.0 };
 
-                            // Chrome: minimum_breadth_overlap = 0.6 for horizontal overlap
                             let x_overlap = (b1[2].min(b2[2]) - b1[0].max(b2[0])).max(0.0);
                             let x_overlap_ratio = if w1.min(w2) > 0.0 {
                                 x_overlap / w1.min(w2)
@@ -431,30 +464,92 @@ impl ChromeOCR {
                                 0.0
                             };
 
-                            // Same row with significant x overlap
                             y_overlap_ratio > 0.6 && x_overlap_ratio > 0.5
                         });
 
                 if is_duplicate {
                     if std::env::var("CHROME_OCR_DEBUG").is_ok() {
-                        println!("    [SKIP] y={} duplicate", actual_y);
+                        println!(
+                            "    [SKIP] y={} duplicate (x={} w={} h={})",
+                            actual_y, x1, sub_w, sub_h
+                        );
                     }
                     continue;
                 }
 
-                // Recognize using shared interpreter
+                // Recognize using shared interpreter(s)
+                // Try CJK (hanijpan) model first, then universal (und) model
+                // Pick the result with higher confidence
                 rec_count += 1;
-                let (text, conf) = self
+                let (text_cjk, conf_cjk) = self
                     .recognizer
                     .recognize_with_interpreter(&sub_region, &rec_interpreter)?;
+
+                let (text, conf) = if let (Some(ref rec_und), Some(ref interp_und)) =
+                    (&self.recognizer_und, &rec_interpreter_und)
+                {
+                    let (text_und, conf_und) =
+                        rec_und.recognize_with_interpreter(&sub_region, interp_und)?;
+
+                    // Chrome multi-pass: UND first, then language-specific.
+                    // For very short text (table cells ≤3 chars), prefer UND if it produces
+                    // ASCII and CJK produces non-ASCII (garbled). CJK model is unreliable
+                    // on tiny crops but correct for normal-sized Chinese text.
+                    let cjk_is_ascii = text_cjk.chars().all(|c| c.is_ascii());
+                    let und_is_ascii = text_und.chars().all(|c| c.is_ascii());
+                    let is_short = text_cjk.chars().count() <= 3 && text_und.chars().count() <= 3;
+
+                    // Chrome uses script detection (GocrScriptDirectionIdentificationMutator)
+                    // to route text to the correct model. We detect script from output:
+                    // If CJK model produces all-ASCII text without spaces, it's likely Latin text
+                    // processed by the wrong model. Prefer UND which handles Latin properly.
+                    let cjk_no_space = !text_cjk.contains(' ') && text_cjk.chars().count() > 5;
+                    let und_has_space = text_und.contains(' ');
+                    let cjk_all_ascii = text_cjk.chars().all(|c| c.is_ascii());
+
+                    let choice =
+                        if is_short && !text_und.is_empty() && und_is_ascii && !cjk_is_ascii {
+                            // Short text: UND ASCII vs CJK garbled → prefer UND
+                            ("und_short", text_und, conf_und)
+                        } else if cjk_all_ascii && cjk_no_space && und_has_space && conf_und > 0.5 {
+                            // Latin body text: CJK model gives no spaces, UND gives proper text
+                            // Real CJK text would contain non-ASCII chars
+                            ("und_latin", text_und, conf_und)
+                        } else if conf_und > conf_cjk && text_und.chars().count() >= 1 {
+                            // UND has higher confidence
+                            ("und_conf", text_und, conf_und)
+                        } else {
+                            ("cjk", text_cjk, conf_cjk)
+                        };
+                    if std::env::var("CHROME_OCR_DEBUG_REC").is_ok() {
+                        println!(
+                            "  [REC] y={} model={} cjk_conf={:.2} und_conf={:.2} text=\"{}\"",
+                            actual_y,
+                            choice.0,
+                            conf_cjk,
+                            conf_und,
+                            &choice.1[..choice.1.len().min(50)]
+                        );
+                    }
+                    (choice.1, choice.2)
+                } else {
+                    (text_cjk, conf_cjk)
+                };
 
                 // Post-process to clean up artifacts
                 let text = Self::post_process_text(&text);
 
                 // Filter out empty, single-char, or low-confidence results
-                // Chrome's GroupDetectionBoxes merges chars to lines - single chars are noise
-                let text_len = text.chars().count();
-                if text_len < 2 || conf < self.min_conf {
+                // Chrome: min_line_length_to_process = 2 from FilterJunkMutator settings
+                // Exception: single ASCII digits are kept (table cells like "5", "4")
+                let text_trimmed = text.trim();
+                let text_len = text_trimmed.chars().count();
+                let is_single_digit = text_len == 1
+                    && text_trimmed
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_ascii_digit());
+                if (text_len < 2 && !is_single_digit) || conf < self.min_conf {
                     if std::env::var("CHROME_OCR_DEBUG").is_ok() {
                         println!(
                             "    [SKIP] y={} len={} conf={:.2}: {}",
@@ -464,35 +559,21 @@ impl ChromeOCR {
                     continue;
                 }
 
-                // Check for text-based duplicates (same or very similar text)
-                let is_text_duplicate = results.iter().any(|prev_text: &String| {
-                    // Exact match
-                    if prev_text == &text {
-                        return true;
-                    }
-                    // One is substring of the other (for partial matches)
-                    let shorter = if prev_text.len() < text.len() {
-                        prev_text
-                    } else {
-                        &text
-                    };
-                    let longer = if prev_text.len() >= text.len() {
-                        prev_text
-                    } else {
-                        &text
-                    };
-                    if shorter.chars().count() >= 3 && longer.contains(shorter.as_str()) {
-                        return true;
-                    }
-                    false
-                });
-
-                if is_text_duplicate {
+                // Chrome-style junk filter (HeuristicLineIsJunk at 0x18022A490)
+                // Filter lines where most characters are junk (punctuation, symbols)
+                if Self::is_junk_line(text_trimmed) {
                     if std::env::var("CHROME_OCR_DEBUG").is_ok() {
-                        println!("    [SKIP] y={} text duplicate: {}", actual_y, text);
+                        println!("    [SKIP] y={} junk: {}", actual_y, text);
                     }
                     continue;
                 }
+
+                // Use trimmed text for comparison and output
+                let text = text_trimmed.to_string();
+
+                // NOTE: Chrome does NOT use text-based duplicate filtering.
+                // Duplicate removal is purely spatial (IoU/containment checks above).
+                // Repeated text (e.g. "Text", "72") in tables is legitimate.
 
                 line_num += 1;
                 recognized_lines.push((x1, actual_y, sub_w, sub_h, conf));
@@ -510,6 +591,144 @@ impl ChromeOCR {
                 results.push(text);
             }
         }
+
+        // Chrome RemoveOverlapsStep + RemoveOverlapsWordPruningStep (from IDA analysis):
+        // 1. Sort lines by height*confidence descending (larger/more confident first)
+        // 2. For each pair: compute IoU and containment
+        // 3. If overlap > 0.6: compare text via char frequency matching
+        // 4. Remove the smaller/less confident overlapping line
+        // 5. Breadth ratio < 0.5 protects lines from removal (different sizes)
+
+        // Build sort order: by (height * confidence) descending
+        let mut order: Vec<usize> = (0..recognized_lines.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (_, _, w_a, h_a, conf_a) = recognized_lines[a];
+            let (_, _, w_b, h_b, conf_b) = recognized_lines[b];
+            let score_a = h_a as f32 * conf_a;
+            let score_b = h_b as f32 * conf_b;
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut keep = vec![true; results.len()];
+
+        for idx_i in 0..order.len() {
+            let i = order[idx_i];
+            if !keep[i] {
+                continue;
+            }
+            let (x1_i, y1_i, w_i, h_i, _conf_i) = recognized_lines[i];
+            let b_i = [
+                x1_i as f32,
+                y1_i as f32,
+                (x1_i as u32 + w_i) as f32,
+                (y1_i as u32 + h_i) as f32,
+            ];
+
+            for idx_j in (idx_i + 1)..order.len() {
+                let j = order[idx_j];
+                if !keep[j] {
+                    continue;
+                }
+                let (x1_j, y1_j, w_j, h_j, _conf_j) = recognized_lines[j];
+                let b_j = [
+                    x1_j as f32,
+                    y1_j as f32,
+                    (x1_j as u32 + w_j) as f32,
+                    (y1_j as u32 + h_j) as f32,
+                ];
+
+                // Chrome RemoveOverlapsStep: compute IoU and containment
+                let iou = calc_iou(&b_i, &b_j);
+                let cont_ij = calc_containment(&b_i, &b_j);
+                let cont_ji = calc_containment(&b_j, &b_i);
+                let max_overlap = iou.max(cont_ij).max(cont_ji);
+
+                // Chrome RemoveOverlapsStep: block_different_direction_maximum = 0.3
+                // Primary gate: max(IoU, containment1, containment2) > 0.3 triggers processing.
+                // After gate, Chrome does symbol-level overlap validation (sub_18045D260).
+                // We approximate: require high IoU (>0.6) for direct removal,
+                // or medium overlap (>0.3) with high Y-overlap ratio (>0.7 = same line).
+                // This prevents removing adjacent body text lines that only overlap from
+                // bbox expansion.
+
+                if max_overlap <= 0.3 {
+                    continue;
+                }
+
+                // Chrome breadth ratio logic (from IDA analysis of RemoveOverlapsStep):
+                // - breadth_ratio < 0.6 AND confidence >= 0.5 → protect (Gate 3)
+                // - breadth_ratio <= 0.5 → trigger symbol-level overlap removal
+                // We approximate symbol-level removal: very small breadth ratio
+                // with reasonable overlap means fragment contained in larger line.
+                let breadth_i = w_i as f32;
+                let breadth_j = w_j as f32;
+                let breadth_ratio = if breadth_i.max(breadth_j) > 0.0 {
+                    breadth_i.min(breadth_j) / breadth_i.max(breadth_j)
+                } else {
+                    0.0
+                };
+
+                // Compute Y overlap ratio (substitute for Chrome's symbol-level validation)
+                let y_overlap = (b_i[3].min(b_j[3]) - b_i[1].max(b_j[1])).max(0.0);
+                let min_h_line = (b_i[3] - b_i[1]).min(b_j[3] - b_j[1]);
+                let y_overlap_ratio = if min_h_line > 0.0 {
+                    y_overlap / min_h_line
+                } else {
+                    0.0
+                };
+
+                // Removal logic with breadth ratio guard.
+                // Chrome's RemoveOverlapsStep:
+                // - breadth_ratio < 0.6 AND confidence >= 0.5 → protect (Gate 3)
+                // - breadth_ratio <= 0.5 → trigger symbol-level check (can override protection)
+                // We use breadth_ratio < 0.5 as general protection, but allow fragment
+                // removal when breadth_ratio < 0.3 (very clear fragment in larger line).
+                let should_remove = if breadth_ratio < 0.3 {
+                    // Very small fragment relative to the other line.
+                    // Chrome does symbol-level overlap check here.
+                    // We approximate: if Y-overlap > 0.4, the fragment is on the same
+                    // physical line as the larger line → remove fragment.
+                    // Threshold 0.44 balances fragment removal vs table cell protection.
+                    // Table cells have Y-overlap ≈ 0.33 (protected).
+                    // Body text fragments have Y-overlap ≈ 0.44-1.0 (removed).
+                    y_overlap_ratio > 0.44
+                } else if breadth_ratio < 0.5 {
+                    false // Protect: similar to Chrome's Gate 3 (different sizes)
+                } else if max_overlap > 0.6 {
+                    true // Chrome RemoveOverlapsWordPruningStep line_overlap_iou_threshold = 0.6
+                } else if y_overlap_ratio > 0.7 {
+                    true // Same-line overlaps (Chrome's symbol-level check would confirm)
+                } else {
+                    false // Adjacent lines: protect
+                };
+
+                if should_remove {
+                    keep[j] = false;
+                    if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                        println!(
+                            "  [DEDUP] drop j={}: \"{}\" (kept i={}: \"{}\") iou={:.2} cont={:.2}/{:.2} y_ovr={:.2}",
+                            j, results[j], i, results[i], iou, cont_ij, cont_ji, y_overlap_ratio
+                        );
+                    }
+                } else if std::env::var("CHROME_OCR_DEBUG").is_ok() && max_overlap > 0.3 {
+                    println!(
+                        "  [DEDUP-SKIP] i={} j={} iou={:.2} cont={:.2}/{:.2} y_ovr={:.2} br={:.2} \"{}\" vs \"{}\"",
+                        i, j, iou, cont_ij, cont_ji, y_overlap_ratio, breadth_ratio,
+                        &results[i][..results[i].len().min(30)],
+                        &results[j][..results[j].len().min(30)]
+                    );
+                }
+            }
+        }
+
+        let results: Vec<String> = results
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| keep[*idx])
+            .map(|(_, s)| s)
+            .collect();
 
         // Update timing stats
         self.stats.recognition_total = rec_start.elapsed().as_secs_f64();
@@ -709,6 +928,33 @@ impl ChromeOCR {
             // Count singleton clusters
             let singletons = clusters.iter().filter(|c| c.len() == 1).count();
             println!("  [DBG] {} singleton clusters", singletons);
+            // Show largest greedy expansion clusters
+            let mut sizes: Vec<(usize, usize)> = clusters
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.len(), i))
+                .collect();
+            sizes.sort_by(|a, b| b.0.cmp(&a.0));
+            for &(sz, idx) in sizes.iter().take(5) {
+                let cl = &clusters[idx];
+                let x1 = cl
+                    .iter()
+                    .map(|&i| boxes[i].x1)
+                    .fold(f32::INFINITY, f32::min);
+                let y1 = cl
+                    .iter()
+                    .map(|&i| boxes[i].y1)
+                    .fold(f32::INFINITY, f32::min);
+                let x2 = cl
+                    .iter()
+                    .map(|&i| boxes[i].x2)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let y2 = cl
+                    .iter()
+                    .map(|&i| boxes[i].y2)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                println!("  [DBG] Greedy cluster[{}]: {} members, bbox=({:.0},{:.0})→({:.0},{:.0}) h={:.0}", idx, sz, x1, y1, x2, y2, y2-y1);
+            }
         }
 
         // Merge overlapping line hypotheses using Union-Find (Chrome config+128: IoU >= 0.1)
@@ -763,7 +1009,20 @@ impl ChromeOCR {
             .map(|cl| cl.iter().map(|&i| boxes[i].height()).sum::<f32>() / cl.len() as f32)
             .collect();
 
-        // Pass 1: Merge overlapping clusters (IoU >= 0.1 or containment > 0.5)
+        // Chrome ClusterLinesSpec: maximum_breadth_gap = 0.7
+        // Breadth = extent along text direction (width for horizontal text)
+        let cluster_avg_w: Vec<f32> = clusters
+            .iter()
+            .map(|cl| cl.iter().map(|&i| boxes[i].width()).sum::<f32>() / cl.len() as f32)
+            .collect();
+
+        // Chrome config: union_box_height_percentage = 2
+        // Max merged height must not exceed 2 * avg_height to prevent super-clusters.
+        let max_merged_height = avg_height * 2.0;
+
+        // Pass 1a: Merge same-line clusters first (high vertical overlap)
+        // This ensures same-line fragments are merged before any cross-line merges
+        // could block them through the height guard.
         for i in 0..num_clusters {
             for j in (i + 1)..num_clusters {
                 let ri = find_cl(&mut cl_parent, i);
@@ -771,17 +1030,70 @@ impl ChromeOCR {
                 if ri == rj {
                     continue;
                 }
-                // Chrome config+128: grouping_box_overlap = 0.1
-                let iou = calc_iou(&cluster_bboxes[i], &cluster_bboxes[j]);
-                if iou >= 0.1 {
-                    cl_parent[rj] = ri;
+
+                let bi = &cluster_bboxes[i];
+                let bj = &cluster_bboxes[j];
+
+                // Check if these are same-line clusters (high vertical overlap)
+                let y_overlap = (bi[3].min(bj[3]) - bi[1].max(bj[1])).max(0.0);
+                let hi = bi[3] - bi[1];
+                let hj = bj[3] - bj[1];
+                let min_h = hi.min(hj);
+                let y_overlap_ratio = if min_h > 0.0 { y_overlap / min_h } else { 0.0 };
+
+                // Must be on the same line (>70% vertical overlap) and have some IoU
+                // 70% threshold prevents adjacent-line merges (typical y_overlap ~0.3-0.5)
+                // while allowing same-line segment merges (y_overlap ~0.9-1.0)
+                if y_overlap_ratio > 0.7 {
+                    let iou = calc_iou(bi, bj);
+                    let cont_ij = calc_containment(bi, bj);
+                    let cont_ji = calc_containment(bj, bi);
+                    if iou >= 0.1 || cont_ij > 0.5 || cont_ji > 0.5 {
+                        cl_parent[rj] = ri;
+                    }
+                }
+            }
+        }
+
+        // Pass 1b: Merge remaining overlapping clusters with height guard
+        for i in 0..num_clusters {
+            for j in (i + 1)..num_clusters {
+                let ri = find_cl(&mut cl_parent, i);
+                let rj = find_cl(&mut cl_parent, j);
+                if ri == rj {
                     continue;
                 }
-                // Also merge if one cluster is mostly contained in another
-                let cont_ij = calc_containment(&cluster_bboxes[i], &cluster_bboxes[j]);
-                let cont_ji = calc_containment(&cluster_bboxes[j], &cluster_bboxes[i]);
-                if cont_ij > 0.5 || cont_ji > 0.5 {
-                    cl_parent[rj] = ri;
+
+                let bi = &cluster_bboxes[i];
+                let bj = &cluster_bboxes[j];
+
+                let should_merge = {
+                    let iou = calc_iou(bi, bj);
+                    if iou >= 0.1 {
+                        true
+                    } else {
+                        let cont_ij = calc_containment(bi, bj);
+                        let cont_ji = calc_containment(bj, bi);
+                        cont_ij > 0.5 || cont_ji > 0.5
+                    }
+                };
+
+                if should_merge {
+                    // Height guard: compute merged bounding box height
+                    let mut merged_y1 = f32::INFINITY;
+                    let mut merged_y2 = f32::NEG_INFINITY;
+                    for k in 0..num_clusters {
+                        let rk = find_cl(&mut cl_parent, k);
+                        if rk == ri || rk == rj {
+                            merged_y1 = merged_y1.min(cluster_bboxes[k][1]);
+                            merged_y2 = merged_y2.max(cluster_bboxes[k][3]);
+                        }
+                    }
+                    let merged_height = merged_y2 - merged_y1;
+
+                    if merged_height <= max_merged_height {
+                        cl_parent[rj] = ri;
+                    }
                 }
             }
         }
@@ -859,12 +1171,21 @@ impl ChromeOCR {
                     continue;
                 }
 
-                // Check gap along line direction
+                // Check gap along line direction (depth gap: Chrome maximum_depth_gap = 1.5)
                 let along = (dx * big_cos + dy * big_sin).abs();
                 let big_w = big_bb[2] - big_bb[0];
                 let small_w = small_bb[2] - small_bb[0];
                 let gap = along - (big_w + small_w) * 0.5;
                 if gap > avg_height * 1.5 {
+                    continue;
+                }
+
+                // Chrome ClusterLinesSpec breadth gap check: maximum_breadth_gap = 0.7
+                // Gap along text direction / min_avg_symbol_breadth must be <= 0.7
+                // This prevents merging clusters that are far apart along the text direction
+                // (e.g., table cells in different columns, column-boundary fragments).
+                let min_avg_w = cluster_avg_w[small_i].min(cluster_avg_w[big_j]);
+                if min_avg_w > 0.0 && gap > 0.0 && gap / min_avg_w > 0.7 {
                     continue;
                 }
 
@@ -886,9 +1207,262 @@ impl ChromeOCR {
                 .extend(clusters[i].iter());
         }
 
+        // Chrome SplitLinesStep (from IDA analysis of sub_18046FB10):
+        // Split merged clusters that span multiple text lines.
+        // Chrome checks space_depth between consecutive symbols.
+        // If space_depth / avg_symbol_depth > maximum_space_ratio, split the line.
+        // We check Y-center gaps between consecutive boxes (depth direction for horizontal text).
+        let mut final_clusters: Vec<Vec<usize>> = Vec::new();
+        for (_root, indices) in &merged_clusters {
+            if indices.len() < 3 {
+                final_clusters.push(indices.clone());
+                continue;
+            }
+
+            // Compute cluster's dominant angle
+            let (sum_sin, sum_cos): (f32, f32) = indices
+                .iter()
+                .map(|&i| (boxes[i].angle.sin(), boxes[i].angle.cos()))
+                .fold((0.0, 0.0), |(s, c), (ds, dc)| (s + ds, c + dc));
+            let cluster_angle = sum_sin.atan2(sum_cos);
+            let angle_deg = cluster_angle.to_degrees().abs();
+
+            // Only split near-horizontal clusters (Chrome handles all angles via depth direction,
+            // but our main problem is horizontal body text merging across lines)
+            if angle_deg > 15.0 && angle_deg < 165.0 {
+                final_clusters.push(indices.clone());
+                continue;
+            }
+
+            // Compute average box height (= avg symbol depth)
+            let cluster_avg_h: f32 =
+                indices.iter().map(|&i| boxes[i].height()).sum::<f32>() / indices.len() as f32;
+
+            // Sort boxes by Y-center (depth direction for horizontal text)
+            let mut sorted_indices = indices.clone();
+            sorted_indices.sort_by(|&a, &b| {
+                let ya = boxes[a].center().1;
+                let yb = boxes[b].center().1;
+                ya.partial_cmp(&yb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let y_centers: Vec<f32> = sorted_indices
+                .iter()
+                .map(|&i| boxes[i].center().1)
+                .collect();
+
+            // Chrome: space_depth / avg_symbol_depth > maximum_space_ratio (~1.5)
+            let split_threshold = cluster_avg_h * 1.5;
+
+            let mut split_points: Vec<usize> = Vec::new();
+            for k in 1..y_centers.len() {
+                let gap = y_centers[k] - y_centers[k - 1];
+                if gap > split_threshold {
+                    split_points.push(k);
+                }
+            }
+
+            if split_points.is_empty() {
+                final_clusters.push(indices.clone());
+            } else {
+                let mut prev = 0;
+                for &sp in &split_points {
+                    let sub: Vec<usize> = sorted_indices[prev..sp].to_vec();
+                    if !sub.is_empty() {
+                        final_clusters.push(sub);
+                    }
+                    prev = sp;
+                }
+                let sub: Vec<usize> = sorted_indices[prev..].to_vec();
+                if !sub.is_empty() {
+                    final_clusters.push(sub);
+                }
+                if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                    println!(
+                        "  [SPLIT-LINE] {} boxes → {} sub-lines (avg_h={:.0} angle={:.1}° splits={:?})",
+                        indices.len(),
+                        split_points.len() + 1,
+                        cluster_avg_h,
+                        cluster_angle.to_degrees(),
+                        split_points.iter().map(|&sp| {
+                            let gap = y_centers[sp] - y_centers[sp - 1];
+                            format!("y_gap={:.0}", gap)
+                        }).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+
+        // Chrome MergeLinesStep (from IDA analysis of sub_1804410C0):
+        // Merge clusters on the same physical text line.
+        // Chrome MergeLinesSpec protobuf defaults (from 0x18214c094):
+        //   minimum_breadth_ratio: 0.6
+        //   maximum_angle_difference: 3°
+        //   minimum_breadth_overlap: 0.6
+        //   maximum_depth_gap: 1.5
+        // Chrome uses direction-aligned breadth/depth. We use axis-aligned
+        // with a tight Y-center proximity check to avoid merging PPT radial text.
+        {
+            // Compute bounding boxes and avg char height for each cluster
+            // Using avg char height (not cluster bbox height) for Y-center proximity check
+            // prevents merging PPT radial text where cluster bboxes are tall (200+px)
+            // but individual chars are only 30-40px.
+            let cluster_info: Vec<(f32, f32, f32, f32, f32, f32)> = final_clusters
+                .iter()
+                .map(|indices| {
+                    let cx1 = indices
+                        .iter()
+                        .map(|&i| boxes[i].x1)
+                        .fold(f32::INFINITY, f32::min);
+                    let cy1 = indices
+                        .iter()
+                        .map(|&i| boxes[i].y1)
+                        .fold(f32::INFINITY, f32::min);
+                    let cx2 = indices
+                        .iter()
+                        .map(|&i| boxes[i].x2)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let cy2 = indices
+                        .iter()
+                        .map(|&i| boxes[i].y2)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let (ss, sc): (f32, f32) = indices
+                        .iter()
+                        .map(|&i| (boxes[i].angle.sin(), boxes[i].angle.cos()))
+                        .fold((0.0, 0.0), |(s, c), (ds, dc)| (s + ds, c + dc));
+                    let angle = ss.atan2(sc);
+                    let avg_char_h: f32 = indices.iter().map(|&i| boxes[i].height()).sum::<f32>()
+                        / indices.len().max(1) as f32;
+                    (cx1, cy1, cx2, cy2, angle, avg_char_h)
+                })
+                .collect();
+
+            let n = final_clusters.len();
+            let mut ml_parent: Vec<usize> = (0..n).collect();
+
+            fn find_ml(parent: &mut [usize], i: usize) -> usize {
+                let mut r = i;
+                while parent[r] != r {
+                    parent[r] = parent[parent[r]];
+                    r = parent[r];
+                }
+                r
+            }
+
+            let mut merged_any = true;
+            while merged_any {
+                merged_any = false;
+                for i in 0..n {
+                    let ri = find_ml(&mut ml_parent, i);
+                    for j in (i + 1)..n {
+                        let rj = find_ml(&mut ml_parent, j);
+                        if ri == rj {
+                            continue;
+                        }
+
+                        let (ax1, ay1, ax2, ay2, a_angle, a_avg_ch) = cluster_info[i];
+                        let (bx1, by1, bx2, by2, b_angle, b_avg_ch) = cluster_info[j];
+
+                        let a_w = ax2 - ax1;
+                        let b_w = bx2 - bx1;
+                        let a_h = ay2 - ay1;
+                        let b_h = by2 - by1;
+                        if a_w <= 0.0 || b_w <= 0.0 || a_h <= 0.0 || b_h <= 0.0 {
+                            continue;
+                        }
+
+                        // 1. Angle check (Chrome: maximum_angle_difference = 3°)
+                        let angle_diff = (a_angle - b_angle).abs();
+                        let angle_diff = if angle_diff > std::f32::consts::PI {
+                            2.0 * std::f32::consts::PI - angle_diff
+                        } else {
+                            angle_diff
+                        };
+                        if angle_diff > 3.0_f32.to_radians() {
+                            continue;
+                        }
+
+                        // 2. Y-center proximity: must be on the same physical line.
+                        // Use avg character box height (not cluster bbox height) so
+                        // tall PPT clusters (~200px bbox with 30px chars) don't get
+                        // a huge threshold that allows cross-line merges.
+                        let a_cy = (ay1 + ay2) * 0.5;
+                        let b_cy = (by1 + by2) * 0.5;
+                        let min_avg_ch = a_avg_ch.min(b_avg_ch);
+                        let y_center_dist = (a_cy - b_cy).abs();
+                        // Same line: Y-center distance < 50% of min avg char height
+                        // (widened from 30% because avg char height is tighter than bbox height)
+                        if y_center_dist > min_avg_ch * 0.5 {
+                            continue;
+                        }
+
+                        // 3. Breadth ratio (Chrome: minimum_breadth_ratio = 0.6)
+                        let breadth_ratio = a_w.min(b_w) / a_w.max(b_w);
+                        if breadth_ratio < 0.6 {
+                            continue;
+                        }
+
+                        // 4. Breadth overlap (Chrome: minimum_breadth_overlap = 0.6)
+                        // OR adjacent with small gap (< 1.5 * avg_height along breadth)
+                        let merged_w = ax2.max(bx2) - ax1.min(bx1);
+                        let breadth_overlap = if merged_w > 0.0 {
+                            (a_w + b_w - merged_w) / merged_w
+                        } else {
+                            0.0
+                        };
+                        let avg_h = (a_h + b_h) * 0.5;
+                        let x_gap = (ax1.max(bx1) - ax2.min(bx2)).max(0.0);
+                        let is_adjacent = x_gap < avg_h * 1.5;
+
+                        if breadth_overlap < 0.6 && !is_adjacent {
+                            continue;
+                        }
+
+                        // All checks passed - merge
+                        ml_parent[rj] = ri;
+                        merged_any = true;
+
+                        if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                            let s = self.detector.scale;
+                            let ox = self.detector.offset_x;
+                            let oy = self.detector.offset_y;
+                            println!(
+                                "  [MERGE-LINES] br={:.2} ang={:.1}° bovr={:.2} ydist={:.0} adj={} ({:.0},{:.0})-({:.0},{:.0}) + ({:.0},{:.0})-({:.0},{:.0})",
+                                breadth_ratio, angle_diff.to_degrees(),
+                                breadth_overlap, y_center_dist, is_adjacent,
+                                (ax1 - ox) / s, (ay1 - oy) / s, (ax2 - ox) / s, (ay2 - oy) / s,
+                                (bx1 - ox) / s, (by1 - oy) / s, (bx2 - ox) / s, (by2 - oy) / s
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Rebuild final_clusters with merged groups
+            let mut merged_map: std::collections::HashMap<usize, Vec<usize>> =
+                std::collections::HashMap::new();
+            for i in 0..n {
+                let root = find_ml(&mut ml_parent, i);
+                merged_map
+                    .entry(root)
+                    .or_default()
+                    .extend(final_clusters[i].iter());
+            }
+            let merge_count = n - merged_map.len();
+            if merge_count > 0 {
+                println!(
+                    "  MergeLinesStep: {} clusters → {} (merged {})",
+                    n,
+                    merged_map.len(),
+                    merge_count
+                );
+            }
+            final_clusters = merged_map.into_values().collect();
+        }
+
         // Debug output
         if std::env::var("CHROME_OCR_DEBUG").is_ok() {
-            for (root, indices) in &merged_clusters {
+            for (idx, indices) in final_clusters.iter().enumerate() {
                 if indices.len() > 15 {
                     let x1 = indices
                         .iter()
@@ -907,8 +1481,8 @@ impl ChromeOCR {
                         .map(|&i| boxes[i].y2)
                         .fold(f32::NEG_INFINITY, f32::max);
                     println!(
-                        "  [DBG] Large group root={}: {} members, bbox=({:.0},{:.0})→({:.0},{:.0})",
-                        root,
+                        "  [DBG] Large group idx={}: {} members, bbox=({:.0},{:.0})→({:.0},{:.0})",
+                        idx,
                         indices.len(),
                         x1,
                         y1,
@@ -920,8 +1494,13 @@ impl ChromeOCR {
         }
 
         // Create merged boxes from clusters
+        // Chrome's Hough Transform requires hough_votes_threshold=10 votes per line.
+        // Our greedy expansion doesn't have this natural threshold.
+        // single_box_confidence_threshold = 0.4 for 1-box clusters.
         let mut merged = Vec::new();
-        for indices in merged_clusters.values() {
+        for indices in &final_clusters {
+            let num_boxes = indices.len();
+
             let x1 = indices
                 .iter()
                 .map(|&i| boxes[i].x1)
@@ -951,17 +1530,105 @@ impl ChromeOCR {
                 .fold((0.0, 0.0), |(s, c), (ds, dc)| (s + ds, c + dc));
             let angle = sum_sin.atan2(sum_cos);
 
+            // Chrome: single-box lines need confidence > 0.4
+            if num_boxes == 1 && conf < 0.4 {
+                if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                    let s = self.detector.scale;
+                    let ox = self.detector.offset_x;
+                    let oy = self.detector.offset_y;
+                    println!(
+                        "  [SKIP single-box] conf={:.2} at ({:.0},{:.0})→({:.0},{:.0})",
+                        conf,
+                        (x1 - ox) / s,
+                        (y1 - oy) / s,
+                        (x2 - ox) / s,
+                        (y2 - oy) / s
+                    );
+                }
+                continue;
+            }
+
+            // Chrome's Hough Transform needs >=10 votes for a line.
+            // Filter merged lines with very few constituent detection boxes
+            // (these are typically noise from arrow/icon regions).
+            // Use a threshold of 5 (Chrome's filter_min_boxes_lines_size default).
+            // Exception: near-horizontal/vertical text with high confidence can have few boxes.
+            let bw = x2 - x1;
+            let bh = y2 - y1;
+            let aspect = if bh > 0.0 { bw / bh } else { 999.0 };
+
+            // Thin bar filter: only catch graphic elements (decorative bars, rules)
+            // that have few detection boxes. Real text lines have 50+ char-level boxes.
+            // Graphic bars typically have <30 scattered detections.
+            let s = self.detector.scale;
+            let orig_h = bh / s;
+            if aspect > 15.0 && orig_h < 30.0 && num_boxes < 30 {
+                if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                    let ox = self.detector.offset_x;
+                    let oy = self.detector.offset_y;
+                    println!(
+                        "  [SKIP thin-bar] {}x{:.0} aspect={:.0} boxes={} at ({:.0},{:.0})",
+                        (bw / s) as i32,
+                        orig_h,
+                        aspect,
+                        num_boxes,
+                        (x1 - ox) / s,
+                        (y1 - oy) / s
+                    );
+                }
+                continue;
+            }
+
+            // Filter lines with very few boxes AND near-vertical angle
+            // Chrome's Hough needs ≥10 votes; vertical icon strips typically have < 5 boxes
+            let angle_deg = angle.to_degrees().abs();
+            let is_near_vertical = angle_deg > 60.0 && angle_deg < 120.0;
+            if num_boxes < 5 && is_near_vertical {
+                if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                    let ox = self.detector.offset_x;
+                    let oy = self.detector.offset_y;
+                    println!(
+                        "  [SKIP vert-few] boxes={} angle={:.1}° at ({:.0},{:.0})→({:.0},{:.0})",
+                        num_boxes,
+                        angle.to_degrees(),
+                        (x1 - ox) / s,
+                        (y1 - oy) / s,
+                        (x2 - ox) / s,
+                        (y2 - oy) / s
+                    );
+                }
+                continue;
+            }
+
+            if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                let ox = self.detector.offset_x;
+                let oy = self.detector.offset_y;
+                println!(
+                    "  [MERGED] boxes={:3} conf={:.2} at ({:.0},{:.0})→({:.0},{:.0}) angle={:.1}°",
+                    num_boxes,
+                    conf,
+                    (x1 - ox) / s,
+                    (y1 - oy) / s,
+                    (x2 - ox) / s,
+                    (y2 - oy) / s,
+                    angle.to_degrees()
+                );
+            }
+
             merged.push(BBox::with_angle(x1, y1, x2, y2, conf, angle));
         }
 
         // Filter out very small boxes (likely noise)
-        // Chrome: width >= 4 && height > 3 (in original coordinates)
+        // Chrome uses minimum box size based on original coordinates
+        // Convert thresholds to 4096-space using scale factor
+        let scale = self.detector.scale;
+        let min_w_4096 = 4.0 * scale; // ~4px original width minimum
+        let min_h_4096 = 3.0 * scale; // ~3px original height minimum
         if std::env::var("CHROME_OCR_DEBUG").is_ok() {
-            let scale = self.detector.scale;
             let ox = self.detector.offset_x;
             let oy = self.detector.offset_y;
             for b in &merged {
-                if b.width() <= 80.0 || b.height() <= 30.0 {
+                if b.width() <= min_w_4096 || b.height() <= min_h_4096 {
                     let orig_x1 = ((b.x1 - ox) / scale) as i32;
                     let orig_y1 = ((b.y1 - oy) / scale) as i32;
                     let orig_x2 = ((b.x2 - ox) / scale) as i32;
@@ -981,11 +1648,125 @@ impl ChromeOCR {
         }
         let merged: Vec<BBox> = merged
             .into_iter()
-            .filter(|b| b.width() > 80.0 && b.height() > 30.0)
+            .filter(|b| b.width() > min_w_4096 && b.height() > min_h_4096)
             .collect();
 
         // Apply NMS to remove overlapping boxes (iou_threshold=0.5)
-        self.nms_merged_boxes(merged, 0.5)
+        let mut result = self.nms_merged_boxes(merged, 0.5);
+        if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+            println!("  After NMS: {} lines", result.len());
+        }
+
+        // Post-grouping: merge small "heading" boxes with adjacent text boxes on the same line
+        // Custom heuristic to fix char-level grouping splitting inline headings.
+        // Uses stricter criteria to avoid over-merging table cells.
+        self.merge_heading_boxes(&mut result);
+
+        result
+    }
+
+    /// Merge small heading-like boxes into adjacent text boxes on the same line.
+    /// A "heading box" is a narrow box (width < median_width * 0.3) that shares Y overlap
+    /// with a wider box and is horizontally adjacent (small gap).
+    fn merge_heading_boxes(&self, lines: &mut Vec<BBox>) {
+        if lines.len() < 2 {
+            return;
+        }
+
+        let scale = self.detector.scale;
+
+        loop {
+            let mut did_merge = false;
+            let n = lines.len();
+
+            // Compute median width to identify "small" boxes
+            let mut widths: Vec<f32> = lines.iter().map(|b| b.width()).collect();
+            widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median_w = widths[widths.len() / 2];
+            // A heading box is narrow (< 30% of median width)
+            let heading_threshold = median_w * 0.3;
+
+            'outer: for i in 0..n {
+                // Only consider small boxes as heading candidates
+                if lines[i].width() > heading_threshold {
+                    continue;
+                }
+                let heading = &lines[i];
+
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let text = &lines[j];
+
+                    // Must be wider than the heading
+                    if text.width() < heading.width() * 2.0 {
+                        continue;
+                    }
+
+                    // Text box must be a single line (not multi-line).
+                    // Multi-line boxes are too tall relative to the heading.
+                    if text.height() > heading.height() * 3.0 {
+                        continue;
+                    }
+
+                    // Y alignment check: heading center must be within text box's Y range
+                    // This prevents merging headings with text on different lines
+                    let heading_cy = (heading.y1 + heading.y2) * 0.5;
+                    if heading_cy < text.y1 || heading_cy > text.y2 {
+                        continue;
+                    }
+
+                    // Horizontal adjacency: heading must be left-adjacent or overlapping with text
+                    // Only merge if heading starts at or before text's left edge
+                    // This prevents merging rightward boxes from different columns
+                    let gap_limit = 50.0 * scale; // ~50 original pixels gap max
+
+                    // Heading must start at/before text's start (left-adjacent pattern)
+                    if heading.x1 > text.x1 + gap_limit {
+                        continue; // Heading is too far right - likely different column
+                    }
+
+                    let x_gap = if heading.x2 < text.x1 {
+                        text.x1 - heading.x2 // heading is to the left of text
+                    } else {
+                        0.0 // heading overlaps with text
+                    };
+
+                    if x_gap > gap_limit {
+                        continue;
+                    }
+
+                    // Merge heading into text box (extend text box)
+                    lines[j] = BBox::with_angle(
+                        heading.x1.min(text.x1),
+                        heading.y1.min(text.y1),
+                        heading.x2.max(text.x2),
+                        heading.y2.max(text.y2),
+                        heading.conf.max(text.conf),
+                        text.angle,
+                    );
+                    lines.remove(i);
+                    did_merge = true;
+
+                    if std::env::var("CHROME_OCR_DEBUG").is_ok() {
+                        let s = self.detector.scale;
+                        let ox = self.detector.offset_x;
+                        let oy = self.detector.offset_y;
+                        let b = &lines[if i < j { j - 1 } else { j }];
+                        println!(
+                            "  [HEADING-MERGE] Merged small box into line at ({:.0},{:.0})-({:.0},{:.0})",
+                            (b.x1 - ox) / s, (b.y1 - oy) / s, (b.x2 - ox) / s, (b.y2 - oy) / s
+                        );
+                    }
+                    break 'outer;
+                }
+            }
+
+            if !did_merge {
+                break;
+            }
+        }
     }
 
     /// Apply NMS to merged boxes - using Chrome's RemoveOverlaps parameters from IDA analysis
@@ -1073,6 +1854,24 @@ impl ChromeOCR {
         let chars: Vec<char> = text.chars().collect();
         let mut i = 0;
 
+        // Strip leading junk characters (detection edge artifacts)
+        // Chrome's PadAndScaleBoxes uses only 4px padding in 4096-space,
+        // but detection boxes may still include edge content like borders, bullets
+        while i < chars.len() {
+            let c = chars[i];
+            // Keep if it's a CJK char or alphanumeric (strict for leading position)
+            // Hiragana/Katakana at leading position are likely artifacts in CJK text
+            if Self::is_strong_content_char(c) {
+                break;
+            }
+            // Keep if it's an opening bracket with matching closer nearby
+            if Self::has_matching_bracket(&chars, i) {
+                break;
+            }
+            // Strip this leading junk character
+            i += 1;
+        }
+
         while i < chars.len() {
             let c = chars[i];
 
@@ -1108,15 +1907,133 @@ impl ChromeOCR {
             i += 1;
         }
 
+        // Strip trailing junk characters
+        while result.ends_with(|c: char| {
+            !Self::is_content_char(c)
+                && c != '。'
+                && c != '.'
+                && c != ')'
+                && c != '）'
+                && c != '」'
+                && c != '】'
+                && c != '%'
+        }) {
+            result.pop();
+        }
+
         result
+    }
+
+    /// Check if a character is meaningful content (not edge artifact)
+    fn is_content_char(c: char) -> bool {
+        c.is_alphanumeric()
+            || (c >= '\u{4E00}' && c <= '\u{9FFF}')  // CJK Unified
+            || (c >= '\u{3400}' && c <= '\u{4DBF}')  // CJK Extension A
+            || (c >= '\u{3040}' && c <= '\u{309F}')  // Hiragana
+            || (c >= '\u{30A0}' && c <= '\u{30FF}')  // Katakana
+            || (c >= '\u{AC00}' && c <= '\u{D7AF}')  // Korean
+            || c == '\u{3000}' // Ideographic space
+    }
+
+    /// Strict content check for leading position - only CJK and ASCII alphanumeric
+    /// Hiragana/Katakana at leading position are often artifacts in Chinese text
+    fn is_strong_content_char(c: char) -> bool {
+        c.is_ascii_alphanumeric()
+            || (c >= '\u{4E00}' && c <= '\u{9FFF}')  // CJK Unified
+            || (c >= '\u{3400}' && c <= '\u{4DBF}')  // CJK Extension A
+            || (c >= '\u{AC00}' && c <= '\u{D7AF}') // Korean
+    }
+
+    /// Check if character at position has a matching bracket in the text
+    fn has_matching_bracket(chars: &[char], pos: usize) -> bool {
+        let c = chars[pos];
+        let closer = match c {
+            '(' => ')',
+            '（' => '）',
+            '「' => '」',
+            '【' => '】',
+            '『' => '』',
+            '[' => ']',
+            '{' => '}',
+            _ => return false,
+        };
+        // Check if closer exists within next 5 chars (for patterns like "(二)")
+        chars[pos + 1..].iter().take(5).any(|&ch| ch == closer)
+    }
+
+    /// Chrome-style junk line filter (HeuristicLineIsJunk at 0x18022A490)
+    /// Filters lines that are mostly junk characters (symbols, punctuation, whitespace)
+    fn is_junk_line(text: &str) -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        let total = chars.len();
+        if total == 0 {
+            return true;
+        }
+
+        // Count meaningful characters (CJK, alphabetic, numeric)
+        let meaningful_count = chars
+            .iter()
+            .filter(|c| {
+                c.is_alphanumeric()
+                    || (**c >= '\u{4E00}' && **c <= '\u{9FFF}') // CJK Unified
+                    || (**c >= '\u{3400}' && **c <= '\u{4DBF}') // CJK Extension A
+                    || (**c >= '\u{3040}' && **c <= '\u{30FF}') // Hiragana/Katakana
+                    || (**c >= '\u{AC00}' && **c <= '\u{D7AF}') // Korean
+            })
+            .count();
+
+        // If less than half the characters are meaningful, it's junk
+        // Chrome checks "stripped fraction" - ratio of junk characters
+        if meaningful_count * 2 < total {
+            return true;
+        }
+
+        // Mixed-script check: CJK + Japanese kana is often garbled OCR
+        // (CJK model produces kana artifacts on non-text regions)
+        let has_cjk = chars.iter().any(|c| {
+            (*c >= '\u{4E00}' && *c <= '\u{9FFF}') || (*c >= '\u{3400}' && *c <= '\u{4DBF}')
+        });
+        let has_kana = chars.iter().any(|c| {
+            (*c >= '\u{30A0}' && *c <= '\u{30FF}') // Katakana
+                || (*c >= '\u{3040}' && *c <= '\u{309F}') // Hiragana
+        });
+        let has_latin = chars.iter().any(|c| c.is_ascii_alphabetic());
+        let has_digit = chars.iter().any(|c| c.is_ascii_digit());
+
+        // Short text mixing kana with CJK/Latin+digits is almost certainly garbled
+        if total <= 8 && has_kana && (has_cjk || has_latin || has_digit) {
+            return true;
+        }
+
+        // Check for repeated characters (Chrome: repeated char detection)
+        if total >= 3 {
+            let mut max_repeat = 1;
+            let mut cur_repeat = 1;
+            for i in 1..chars.len() {
+                if chars[i] == chars[i - 1] {
+                    cur_repeat += 1;
+                    if cur_repeat > max_repeat {
+                        max_repeat = cur_repeat;
+                    }
+                } else {
+                    cur_repeat = 1;
+                }
+            }
+            // If more than 2/3 of the line is repeated same character
+            if max_repeat * 3 > total * 2 {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Split multi-line region using horizontal projection
     fn split_multiline_region(&self, region: &GrayImage) -> Vec<(GrayImage, u32)> {
         let (w, h) = (region.width(), region.height());
 
-        // Don't split short regions
-        if h < 60 {
+        // Don't split short regions (must be > ~2 lines to have multi-line content)
+        if h < 30 {
             return vec![(region.clone(), 0)];
         }
 
