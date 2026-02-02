@@ -226,6 +226,7 @@ fn flush_pending_captures() {
         }
 
         let counter = CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        println!("  [hook] Capture #{}: batch={}", counter, cap.batch);
 
         for b in 0..cap.batch as usize {
             let offset = b * pixels_per_item;
