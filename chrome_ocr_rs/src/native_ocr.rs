@@ -5,7 +5,9 @@ use anyhow::{anyhow, Result};
 use image::GrayImage;
 use libloading::{Library, Symbol};
 use std::ffi::CString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::native_hook;
 
 // =============================================================================
 // SkBitmap ABI structures (reverse engineered from chrome_screen_ai.dll)
@@ -155,10 +157,15 @@ pub struct NativeOCR {
     perform_ocr: PerformOcrFn,
     free_char_array: FreeCharArrayFn,
     pub max_dimension: u32,
+    _hook: Option<native_hook::NativeHook>,
 }
 
 impl NativeOCR {
     pub fn new(model_dir: &Path) -> Result<Self> {
+        Self::new_with_hook(model_dir, None)
+    }
+
+    pub fn new_with_hook(model_dir: &Path, hook_output_dir: Option<PathBuf>) -> Result<Self> {
         // Look for chrome_screen_ai.dll in multiple locations
         let chrome_dll_path = Self::find_dll(model_dir)?;
 
@@ -202,11 +209,19 @@ impl NativeOCR {
             println!("  NativeOCR: max dimension = {}", max_dimension);
             println!("  NativeOCR: initialized");
 
+            // Install hook after DLL is loaded and initialized
+            // (chrome_screen_ai.dll statically links TFLite and exports its C API)
+            let hook = match hook_output_dir {
+                Some(dir) => Some(native_hook::NativeHook::install(&chrome_dll_path, dir)?),
+                None => None,
+            };
+
             Ok(Self {
                 _library: library,
                 perform_ocr,
                 free_char_array,
                 max_dimension,
+                _hook: hook,
             })
         }
     }
@@ -260,6 +275,11 @@ impl NativeOCR {
 
         let mut result_len = 0u32;
         let result_ptr = unsafe { (self.perform_ocr)(&bitmap, &mut result_len) };
+
+        // Flush any pending hook captures (data is valid now, after inference)
+        if self._hook.is_some() {
+            native_hook::flush_final_captures();
+        }
 
         if result_ptr.is_null() {
             return Err(anyhow!("PerformOCR returned null"));

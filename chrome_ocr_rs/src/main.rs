@@ -5,6 +5,7 @@ use std::time::Instant;
 
 mod cluster_sort;
 mod detector;
+mod native_hook;
 mod native_ocr;
 mod ocr;
 mod recognizer;
@@ -43,6 +44,10 @@ struct Args {
     /// Run both TFLite and Native modes for comparison (AB test)
     #[arg(long)]
     ab: bool,
+
+    /// Hook TfLiteInterpreterInvoke and save recognition model inputs to this directory
+    #[arg(long, requires = "native")]
+    hook_rec_inputs: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -130,7 +135,7 @@ fn run_native_ocr(args: &Args, model_dir: &PathBuf) -> Result<()> {
     println!("Mode: Native (chrome_screen_ai.dll)");
 
     let load_start = Instant::now();
-    let native_ocr = native_ocr::NativeOCR::new(model_dir)?;
+    let native_ocr = native_ocr::NativeOCR::new_with_hook(model_dir, args.hook_rec_inputs.clone())?;
     let load_time = load_start.elapsed();
 
     println!("Opening image: {}", args.image_path.display());
